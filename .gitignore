@@ -1,0 +1,18 @@
+# 生成物与缓存
+__pycache__/
+*.pyc
+output/
+
+# .NET 构建产物
+bin/
+obj/
+
+# 浏览器验证工具产生的快照
+.playwright-mcp/
+
+# 复制的游戏客户端沙盒(约 8GB;只在本项目内改,禁止入库/进入快照 diff)
+client/
+
+# 打包输出(完整包 8GB 级,禁止入库)
+dist/
+*.zip

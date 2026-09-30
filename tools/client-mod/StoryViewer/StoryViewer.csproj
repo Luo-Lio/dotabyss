@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    StoryViewer:在复制的客户端内提供「剧情列表 + 用游戏自身引擎播放任意剧情」的插件。
+    构建:dotnet build -c Release
+    部署:dotnet build -c Release 后由 build.ps1 复制到 client\BepInEx\plugins\StoryViewer\
+
+    引用全部取自已复制客户端的 BepInEx 目录,不依赖 NuGet 上的 BepInEx 包版本,
+    避免与客户端内实际运行版本不一致。
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>StoryViewer</AssemblyName>
+    <RootNamespace>StoryViewer</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DebugType>none</DebugType>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Version>0.7.17</Version>
+    <Product>StoryViewer</Product>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <!-- 复制出来的客户端目录(含 BepInEx\core、BepInEx\interop、BepInEx\unity-libs) -->
+    <ClientDir Condition="'$(ClientDir)' == ''">$(MSBuildProjectDirectory)\..\..\client</ClientDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- BepInEx 运行时(dobby.dll 为原生库,排除) -->
+    <Reference Include="$(ClientDir)\BepInEx\core\*.dll"
+               Exclude="$(ClientDir)\BepInEx\core\dobby.dll" Private="false" />
+    <!-- 游戏与 UnityEngine 的 Il2Cpp 代理程序集(必须用这里的 UnityEngine,unity-libs 里的是非代理版) -->
+    <Reference Include="$(ClientDir)\BepInEx\interop\*.dll" Private="false" />
+  </ItemGroup>
+
+</Project>

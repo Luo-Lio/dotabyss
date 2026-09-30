@@ -1,0 +1,1083 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ドットアビスX 离线版共享逻辑:路径、版本文件、自检、修复、探针、更新安装辅助。
+
+只做本地文件操作与进程探测,不发起网络请求(网络逻辑在 dotabyss_launcher.py)。
+结构对标 TSKX 离线版(``tools/tskx_offline_core.py``),便于两边一起维护。
+"""
+
+from dataclasses import dataclass
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import time
+import zipfile
+
+
+# ---------------------------------------------------------------- 常量
+
+EXE_NAME = "ドットアビスX.exe"
+GAME_PROCESS = "ドットアビスX"
+LAUNCHER_EXE_NAME = "DotabyssOfflineLauncher.exe"
+LAUNCHER_JSON_NAME = "launcher.json"
+VERSION_NAME = "offline_version.json"
+
+PLUGIN_REL = ("BepInEx", "plugins", "StoryViewer")
+CONFIG_REL = ("BepInEx", "config", "dotabyss.storyviewer.cfg")
+DATA_DIR_NAME = "ドットアビスX_Data"
+CACHE_DIR_NAME = "Caches"
+
+# 离线身份隔离:app.info 产品名加此后缀,LocalLow 存档/缓存/注册表与在线版完全分开。
+IDENTITY_SUFFIX = "_offline"
+APP_INFO_NAME = "app.info"
+
+# 包内 catalog 种子(插件目录 catalog_seed\,插件优先读它,首备时同步到 LocalLow)。
+CATALOG_SEED_DIR_NAME = "catalog_seed"
+CATALOG_BIN_NAME = "catalog_1.bin"
+CATALOG_HASH_NAME = "catalog_1.bin.hash"
+
+# 包内 LocalLow 附属种子目录(如 AbsfRuntimeConfig.dat;只补缺失、不覆盖)。
+LOCAL_LOW_SEED_DIR_NAME = "local_low_seed"
+
+# LocalLow 根目录覆盖(自测/重定向用;留空则用系统默认)。
+LOCAL_LOW_ENV = "DOTABYSS_LOCAL_LOW_BASE"
+
+# 插件内置假 API 服务器端口(与 dotabyss.storyviewer.cfg 的 [Offline] ApiPort 一致)。
+API_PORT = 18923
+
+# 离线档要求的配置键:键名 → 期望值(true/false)。缺一不可,否则游戏会连真服务器。
+OFFLINE_KEYS = (
+    ("OfflineAuth", "true"),
+    ("OfflineApi", "true"),
+    ("RedirectAssetServer", "true"),
+    ("ServeCachedBundles", "true"),
+    ("SkipRequestEncryption", "true"),
+    ("ForceDmmSdkSuccess", "true"),
+    ("CaptureForward", "false"),
+)
+
+# 判定"缓存完整"的下限:当前客户端 _Data\\Caches 顶层 21813 个条目,
+# 阈值取 10000,给未来结构调整留余量;明显偏低说明没拷全(会黑屏)。
+CACHE_MIN_ENTRIES = 10000
+# stories.json 至少要有的剧情条数(当前 1229)。
+STORIES_MIN_COUNT = 100
+# 日志超过该体积时由「修复」归档,避免无限膨胀。
+LOG_ARCHIVE_BYTES = 10 * 1024 * 1024
+
+_STORIES_PREFIXES = ("mas_", "men_", "hmn_", "hmr_", "evs_")
+_MD5_CHUNK_SIZE = 1024 * 1024
+_PORT_TIMEOUT_SECONDS = 0.2
+_ZONE_STREAM = ":Zone.Identifier"
+
+# 更新附件名 → 解析出的键(与 build_github_pack.py 的产出、GitHub Release 附件名一致)。
+_ASSET_URL_KEYS = {
+    "version.json": "version_json_url",
+    "StoryViewer.dll": "plugin_dll_url",
+    "stories.json": "stories_url",
+    "previews.zip": "previews_zip_url",
+    "player_docs.zip": "player_docs_url",
+    LAUNCHER_EXE_NAME: "launcher_exe_url",
+    CATALOG_BIN_NAME: "catalog_bin_url",
+    CATALOG_HASH_NAME: "catalog_hash_url",
+    "client_body.zip": "client_body_zip_url",
+    "caches_update.zip": "caches_zip_url",
+}
+
+# 更新包里允许落地的玩家文档(白名单,防止 zip 混入任意文件)。
+PLAYER_DOC_NAMES = (
+    "使用说明.md",
+    "安装排障.md",
+    "启动器使用说明.txt",
+    "check_health.bat",
+)
+
+
+@dataclass
+class CheckItem:
+    """健康检查单项结果。
+
+    参数:name 为固定检查名,ok 表示是否通过,detail 为中文诊断信息。
+    """
+
+    name: str
+    ok: bool
+    detail: str
+
+
+@dataclass
+class ProbeItem:
+    """索引探针单项结果(仅用于 ``index_probe``,不进入 ``health_check``)。"""
+
+    name: str
+    ok: bool
+    detail: str
+
+
+# ---------------------------------------------------------------- 路径
+
+def plugin_dir(game_dir: str) -> str:
+    """返回插件目录(``BepInEx/plugins/StoryViewer``)。"""
+    return os.path.join(game_dir, *PLUGIN_REL)
+
+
+def config_path(game_dir: str) -> str:
+    """返回插件配置文件路径(``BepInEx/config/dotabyss.storyviewer.cfg``)。"""
+    return os.path.join(game_dir, *CONFIG_REL)
+
+
+def version_path(game_dir: str) -> str:
+    """返回离线版本文件路径(插件目录下 ``offline_version.json``)。"""
+    return os.path.join(plugin_dir(game_dir), VERSION_NAME)
+
+
+def cache_dir(game_dir: str) -> str:
+    """返回客户端自带的 bundle 缓存目录(``ドットアビスX_Data/Caches``)。
+
+    离线播放全部依赖这份缓存;插件对未命中的 bundle 直接回 404、不回源 CDN。
+    """
+    return os.path.join(game_dir, DATA_DIR_NAME, CACHE_DIR_NAME)
+
+
+def data_dir(game_dir: str) -> str:
+    """返回游戏数据目录(``ドットアビスX_Data``)。"""
+    return os.path.join(game_dir, DATA_DIR_NAME)
+
+
+def app_info_path(game_dir: str) -> str:
+    """返回 Unity 身份文件 ``_Data\\app.info``(两行:公司名、产品名)。"""
+    return os.path.join(game_dir, DATA_DIR_NAME, APP_INFO_NAME)
+
+
+def catalog_seed_dir(game_dir: str) -> str:
+    """返回包内 catalog 种子目录(``BepInEx/plugins/StoryViewer/catalog_seed``)。"""
+    return os.path.join(plugin_dir(game_dir), CATALOG_SEED_DIR_NAME)
+
+
+def local_low_seed_dir(game_dir: str) -> str:
+    """返回包内 LocalLow 附属种子目录(``BepInEx/plugins/StoryViewer/local_low_seed``)。"""
+    return os.path.join(plugin_dir(game_dir), LOCAL_LOW_SEED_DIR_NAME)
+
+
+def stories_path(game_dir: str) -> str:
+    """返回剧情索引文件路径(插件目录下 ``stories.json``)。"""
+    return os.path.join(plugin_dir(game_dir), "stories.json")
+
+
+def previews_dir(game_dir: str) -> str:
+    """返回剧情封面目录(插件目录下 ``previews``)。"""
+    return os.path.join(plugin_dir(game_dir), "previews")
+
+
+def logs_dir(game_dir: str) -> str:
+    """返回 BepInEx 日志目录。"""
+    return os.path.join(game_dir, "BepInEx")
+
+
+def launcher_path(game_dir: str) -> str:
+    """返回启动器 exe 路径(游戏根目录,与游戏主程序同级)。"""
+    return os.path.join(game_dir, LAUNCHER_EXE_NAME)
+
+
+def launcher_json_path(game_dir: str) -> str:
+    """返回 ``launcher.json`` 路径(游戏根目录,记录 GitHub 仓库)。"""
+    return os.path.join(game_dir, LAUNCHER_JSON_NAME)
+
+
+def plugin_dll_path(game_dir: str) -> str:
+    """返回插件 DLL 路径(``BepInEx/plugins/StoryViewer/StoryViewer.dll``)。"""
+    return os.path.join(plugin_dir(game_dir), "StoryViewer.dll")
+
+
+def plugin_file_version(game_dir: str) -> str:
+    """读取插件 DLL 的 ProductVersion(经 PowerShell 读 VersionInfo)。
+
+    说明:配置头注释是 BepInEx 建文件时写下的旧值(升级插件不刷新),
+    所以版本显示与打包都以 DLL 本体为准;读不到返回空串。
+    """
+    dll = plugin_dll_path(game_dir)
+    if not os.path.isfile(dll):
+        return ""
+    command = ("(Get-Item -LiteralPath '%s').VersionInfo.ProductVersion"
+               % dll.replace("'", "''"))
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", command],
+                                capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (result.stdout or "").strip()
+
+
+# ---------------------------------------------------------------- 离线身份
+
+def read_identity(game_dir: str) -> tuple:
+    """读取 ``app.info`` 的 ``(公司名, 产品名)``;缺失或损坏返回 ``("", "")``。"""
+    path = app_info_path(game_dir)
+    if not os.path.isfile(path):
+        return "", ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return "", ""
+    if len(lines) < 2:
+        return "", ""
+    return lines[0].strip(), lines[1].strip()
+
+
+def ensure_offline_identity(game_dir: str) -> str:
+    """把 ``app.info`` 产品名改为 ``_offline`` 后缀(身份隔离),返回中文说明。
+
+    首次改动前留 ``app.info.bak_original`` 备份(不进包);已隔离时为空操作。
+    """
+    path = app_info_path(game_dir)
+    company, product = read_identity(game_dir)
+    if not company or not product:
+        return "app.info 缺失或损坏,无法设置离线身份(请重新解压完整包)"
+    if product.endswith(IDENTITY_SUFFIX):
+        return "离线身份已就绪(%s)" % product
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        new_product = product + IDENTITY_SUFFIX
+        lines = raw.decode("utf-8", errors="replace").split("\n")
+        if len(lines) < 2:
+            return "app.info 格式异常,未改动"
+        backup = path + ".bak_original"
+        if not os.path.isfile(backup):
+            shutil.copy2(path, backup)
+        lines[1] = new_product
+        with open(path, "wb") as handle:
+            handle.write("\n".join(lines).encode("utf-8"))
+    except OSError as error:
+        return "设置离线身份失败:%s" % error
+    return "已设置离线身份:%s → %s" % (product, new_product)
+
+
+def _sanitize_path_part(name: str) -> str:
+    """按 Unity 规则清洗路径片段:非法字符与结尾句点替换为下划线。
+
+    实测 Unity 把公司名 ``EXNOA LLC.`` 映射为目录 ``EXNOA LLC_``(结尾句点
+    在 Windows 路径里非法),此处只做必要规则,保证 ``_offline`` 目录推导正确。
+    """
+    cleaned = "".join(
+        "_" if (ch in '<>:"/\\|?*' or ord(ch) < 32) else ch for ch in name)
+    trailing = len(cleaned) - len(cleaned.rstrip("."))
+    if trailing:
+        cleaned = cleaned[:-trailing] + "_" * trailing
+    return cleaned
+
+
+def local_low_base() -> str:
+    """返回 LocalLow 根目录;环境变量 ``DOTABYSS_LOCAL_LOW_BASE`` 可覆盖(测试用)。"""
+    override = (os.environ.get(LOCAL_LOW_ENV) or "").strip()
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), "AppData", "LocalLow")
+
+
+def local_low_dir(game_dir: str, base: str = "") -> str:
+    """返回离线身份对应的 LocalLow 应用目录(仅推导路径,不创建)。"""
+    company, product = read_identity(game_dir)
+    if not company or not product:
+        return ""
+    root = base or local_low_base()
+    return os.path.join(root, _sanitize_path_part(company), _sanitize_path_part(product))
+
+
+def local_low_catalog_dir(game_dir: str, base: str = "") -> str:
+    """返回离线身份下 Addressables catalog 目录(``LocalLow\\...\\com.unity.addressables``)。"""
+    root = local_low_dir(game_dir, base)
+    return os.path.join(root, "com.unity.addressables") if root else ""
+
+
+def local_low_catalog_dirs(game_dir: str, base: str = "") -> list:
+    """返回 catalog 搜索候选目录:离线身份目录在前,原版身份目录在后。"""
+    company, product = read_identity(game_dir)
+    if not company or not product:
+        return []
+    root = base or local_low_base()
+    products = [product]
+    if product.endswith(IDENTITY_SUFFIX):
+        products.append(product[:-len(IDENTITY_SUFFIX)])
+    directories = []
+    for name in products:
+        path = os.path.join(root, _sanitize_path_part(company),
+                            _sanitize_path_part(name), "com.unity.addressables")
+        if path not in directories:
+            directories.append(path)
+    return directories
+
+
+# ---------------------------------------------------------------- catalog 种子
+
+def _find_hash_file(bin_path: str) -> str:
+    """找 bin 的配对哈希文件,支持 ``<bin>.hash`` 与 ``<name>.hash`` 两种命名。"""
+    for candidate in (bin_path + ".hash", os.path.splitext(bin_path)[0] + ".hash"):
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def newest_catalog_pair(directory: str) -> tuple:
+    """取目录里最近修改的 ``(*.bin, 配对 .hash)``;没有返回 ``("", "")``。"""
+    if not directory or not os.path.isdir(directory):
+        return "", ""
+    candidates = [
+        os.path.join(directory, name) for name in os.listdir(directory)
+        if name.lower().endswith(".bin") and os.path.isfile(os.path.join(directory, name))
+    ]
+    if not candidates:
+        return "", ""
+    newest = max(candidates, key=lambda path: (os.path.getmtime(path), path))
+    return newest, _find_hash_file(newest)
+
+
+def seed_catalog_pair(game_dir: str) -> tuple:
+    """取包内 catalog 种子 ``(bin, hash)``;没有返回 ``("", "")``。"""
+    return newest_catalog_pair(catalog_seed_dir(game_dir))
+
+
+def source_catalog_pair(game_dir: str, base: str = "") -> tuple:
+    """打包用:优先离线身份的 LocalLow,其次原版 LocalLow,取最近的 catalog。"""
+    for directory in local_low_catalog_dirs(game_dir, base):
+        pair = newest_catalog_pair(directory)
+        if pair[0]:
+            return pair
+    return "", ""
+
+
+def catalog_hash_text(hash_path: str) -> str:
+    """读 ``.hash`` 文件内容(去首尾空白);读不到返回空串。"""
+    if not hash_path or not os.path.isfile(hash_path):
+        return ""
+    try:
+        with open(hash_path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def catalog_seed_hash(game_dir: str) -> str:
+    """返回包内 catalog 种子的哈希值(未打包返回空串)。"""
+    return catalog_hash_text(seed_catalog_pair(game_dir)[1])
+
+
+def write_catalog_seed(game_dir: str, src_bin: str, src_hash: str, stamp: str = "",
+                       backup: bool = True) -> str:
+    """把 source catalog 写为包内种子(固定名 ``catalog_1.bin`` + ``.hash``)。
+
+    返回中文说明;``.hash`` 缺失抛 ``ValueError``(catalog 必须带哈希)。
+    ``backup`` False 时不写 ``.bak_*``(打包产物不允许出现备份文件)。
+    """
+    if not src_bin or not os.path.isfile(src_bin):
+        raise ValueError("catalog 源文件不存在:%s" % src_bin)
+    if not src_hash or not os.path.isfile(src_hash):
+        raise ValueError("catalog 缺少配对 .hash 文件:%s" % src_hash)
+    dest_dir = catalog_seed_dir(game_dir)
+    os.makedirs(dest_dir, exist_ok=True)
+    if not stamp:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+    for src, name in ((src_bin, CATALOG_BIN_NAME), (src_hash, CATALOG_HASH_NAME)):
+        dest = os.path.join(dest_dir, name)
+        if backup and os.path.isfile(dest):
+            shutil.copy2(dest, dest + ".bak_" + stamp)
+        shutil.copy2(src, dest)
+    return "已写入 catalog 种子(%d 字节,hash %s)" % (
+        os.path.getsize(os.path.join(dest_dir, CATALOG_BIN_NAME)),
+        catalog_hash_text(os.path.join(dest_dir, CATALOG_HASH_NAME))[:12])
+
+
+def seed_catalog_to_local_low(game_dir: str, base: str = "") -> list:
+    """把包内 catalog 种子播种到离线身份 LocalLow(游戏与插件实际读取处)。
+
+    幂等:目标哈希与种子一致时直接跳过。返回中文日志行列表。
+    """
+    seed_bin, seed_hash = seed_catalog_pair(game_dir)
+    if not seed_bin:
+        return ["包内缺 catalog 种子(请重新解压完整包)"]
+    target_dir = local_low_catalog_dir(game_dir, base)
+    if not target_dir:
+        return ["无法确定存档目录(app.info 缺失),catalog 未播种"]
+    seed_hash_text = catalog_hash_text(seed_hash)
+    target_bin = os.path.join(target_dir, CATALOG_BIN_NAME)
+    target_hash = os.path.join(target_dir, CATALOG_HASH_NAME)
+    if os.path.isfile(target_bin) and seed_hash_text:
+        if catalog_hash_text(target_hash) == seed_hash_text:
+            return ["离线 catalog 已就绪(hash %s)" % seed_hash_text[:12]]
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        for src, name in ((seed_bin, CATALOG_BIN_NAME), (seed_hash, CATALOG_HASH_NAME)):
+            if not src or not os.path.isfile(src):
+                continue
+            dest = os.path.join(target_dir, name)
+            if os.path.isfile(dest):
+                shutil.copy2(dest, dest + ".bak_" + stamp)
+            shutil.copy2(src, dest)
+    except OSError as error:
+        return ["catalog 播种失败:%s" % error]
+    return ["已播种离线 catalog(hash %s)" % (seed_hash_text[:12] or "未知")]
+
+
+def seed_local_low_extras(game_dir: str, base: str = "") -> list:
+    """把包内 LocalLow 附属种子(如 ``AbsfRuntimeConfig.dat``)补进离线存档目录。
+
+    规则:只补"目标不存在"的文件,绝不覆盖玩家已有文件;返回中文日志行列表。
+    """
+    source = local_low_seed_dir(game_dir)
+    if not os.path.isdir(source):
+        return []
+    target = local_low_dir(game_dir, base)
+    if not target:
+        return ["无法确定存档目录(app.info 缺失),附属种子未播种"]
+    lines = []
+    for name in sorted(os.listdir(source)):
+        src = os.path.join(source, name)
+        dest = os.path.join(target, name)
+        if not os.path.isfile(src) or os.path.isfile(dest):
+            continue
+        try:
+            os.makedirs(target, exist_ok=True)
+            shutil.copy2(src, dest)
+            lines.append("已补种存档目录文件 %s" % name)
+        except OSError as error:
+            lines.append("补种 %s 失败:%s" % (name, error))
+    return lines
+
+
+def install_catalog_from_bytes(game_dir: str, raw_bin: bytes, raw_hash: bytes,
+                               stamp: str) -> str:
+    """把下载的 catalog 写入包内种子目录(更新流程用)。
+
+    说明:调用前调用方已校验 md5 与哈希内容;``stamp`` 用于备份后缀。
+    返回中文说明。
+    """
+    dest_dir = catalog_seed_dir(game_dir)
+    os.makedirs(dest_dir, exist_ok=True)
+    pairs = ((CATALOG_BIN_NAME, raw_bin), (CATALOG_HASH_NAME, raw_hash))
+    for name, data in pairs:
+        dest = os.path.join(dest_dir, name)
+        if os.path.isfile(dest):
+            shutil.copy2(dest, dest + ".bak_" + stamp)
+        with open(dest, "wb") as handle:
+            handle.write(data)
+    return "已更新 catalog 种子(%d 字节)" % len(raw_bin)
+
+
+# ---------------------------------------------------------------- 版本文件
+
+def load_version(game_dir: str) -> dict:
+    """读取离线版本元数据;缺失时返回带默认值的独立副本。"""
+    path = version_path(game_dir)
+    if not os.path.isfile(path):
+        return {"version": "", "baseline": "", "channel": "", "plugin_version": "", "first_ready": False}
+    try:
+        with open(path, "r", encoding="utf-8") as version_file:
+            data = json.load(version_file)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {"version": "", "baseline": "", "channel": "", "plugin_version": "", "first_ready": False}
+
+
+def save_version(game_dir: str, data: dict) -> None:
+    """把离线版本元数据写入插件目录(UTF-8、LF、缩进 2)。"""
+    path = version_path(game_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as version_file:
+        json.dump(data, version_file, ensure_ascii=False, indent=2)
+        version_file.write("\n")
+
+
+# ---------------------------------------------------------------- 文件与安装
+
+def file_md5(path: str) -> str:
+    """计算文件 MD5 十六进制摘要(小写 32 位)。"""
+    digest = hashlib.md5()
+    with open(path, "rb") as source_file:
+        while True:
+            chunk = source_file.read(_MD5_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_needs_update(path: str, expected_md5: str) -> bool:
+    """本地文件是否需要用期望 md5 的文件替换(期望为空 → False)。"""
+    if not expected_md5:
+        return False
+    if not os.path.isfile(path):
+        return True
+    return file_md5(path) != str(expected_md5).lower()
+
+
+def install_bytes(dest_path: str, data: bytes, expected_md5: str, stamp: str,
+                  replace: bool = True, backup: bool = True) -> str:
+    """校验 md5 后写入目标文件(失败不覆盖旧文件、不留 ``.new``)。
+
+    参数:dest_path 最终路径;data 原始字节;expected_md5 期望摘要;stamp 备份后缀;
+        replace False 时只落 ``dest_path.new``(启动器自换用);backup False 时不写
+        ``.bak_update_*``。
+    返回:中文操作说明。md5 不符抛 ``ValueError``。
+    """
+    digest = hashlib.md5(data).hexdigest()
+    if digest != str(expected_md5).lower():
+        raise ValueError("md5 不符:得到 %s,期望 %s" % (digest, expected_md5))
+    parent = os.path.dirname(dest_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    new_path = dest_path + ".new"
+    with open(new_path, "wb") as handle:
+        handle.write(data)
+    if not replace:
+        return "已写出 " + os.path.basename(new_path)
+    if backup and os.path.isfile(dest_path):
+        shutil.copy2(dest_path, dest_path + ".bak_update_" + stamp)
+    os.replace(new_path, dest_path)
+    return "已安装 " + os.path.basename(dest_path)
+
+
+def pending_launcher_swap(game_dir: str) -> bool:
+    """游戏根是否存在待替换的启动器 ``.new``。"""
+    return os.path.isfile(launcher_path(game_dir) + ".new")
+
+
+def build_launcher_replace_cmd(game_dir: str) -> str:
+    """构造「退出后替换并重启启动器」的 cmd 脚本字符串(不 spawn)。
+
+    重要:必须配合 ``subprocess.Popen(script, shell=True)`` 使用。``cmd /c`` 的脚本
+    里带引号路径时,若用 argv 列表形式,Python 的 ``list2cmdline`` 会把内层引号转义成
+    ``\\"``,而 cmd.exe 不认这种转义,脚本会静默失败(2026-09-24 实测)。
+    """
+    exe = launcher_path(game_dir)
+    new = exe + ".new"
+    return 'ping 127.0.0.1 -n 3 >nul & move /Y "%s" "%s" & start "" "%s"' % (
+        new, exe, exe)
+
+
+def extract_zip_bytes(data: bytes, dest_dir: str, allowed_names=None) -> int:
+    """从内存 zip 安全解压到目录,返回写出的文件数。
+
+    安全规则:成员必须是相对路径、不含 ``..`` 与盘符;``allowed_names`` 非空时
+    只接受该白名单内的顶层文件名。任何违规成员直接抛 ``ValueError``(先验后写)。
+    """
+    written = 0
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = archive.namelist()
+        for name in names:
+            normalized = name.replace("\\", "/")
+            if normalized.startswith("/") or ":" in normalized:
+                raise ValueError("zip 成员路径不合法:%s" % name)
+            parts = [part for part in normalized.split("/") if part not in ("", ".")]
+            if any(part == ".." for part in parts):
+                raise ValueError("zip 成员含上跳路径:%s" % name)
+            if allowed_names is not None and (len(parts) != 1 or parts[0] not in allowed_names):
+                raise ValueError("zip 成员不在白名单内:%s" % name)
+        for name in names:
+            normalized = name.replace("\\", "/")
+            if normalized.endswith("/"):
+                continue
+            target = os.path.join(dest_dir, *[p for p in normalized.split("/") if p])
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with archive.open(name) as source, open(target, "wb") as out:
+                shutil.copyfileobj(source, out)
+            written += 1
+    return written
+
+
+# ---------------------------------------------------------------- 差量安装
+
+def rel_path_safe(game_dir: str, rel: str):
+    """把更新清单里的相对路径解析为游戏目录下的绝对路径;不合法返回 ``None``。"""
+    if not rel:
+        return None
+    normalized = rel.replace("\\", "/")
+    if normalized.startswith("/") or ":" in normalized:
+        return None
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return os.path.join(game_dir, *parts)
+
+
+# 客户端本体更新禁止落地的路径(插件/缓存/身份/启动器/文档由各自通道更新)。
+_CLIENT_BODY_BLOCKED_PREFIXES = ("BepInEx/", DATA_DIR_NAME + "/" + CACHE_DIR_NAME + "/")
+_CLIENT_BODY_BLOCKED_PARTS = frozenset(("shots", "capture", "__pycache__"))
+_CLIENT_BODY_BLOCKED_SUFFIXES = (".log", ".new", ".pdb", ".bak", ".pyc")
+
+
+def client_body_rel_allowed(rel: str) -> bool:
+    """判断客户端本体清单里的相对路径是否允许落地(黑名单式)。"""
+    normalized = rel.replace("\\", "/")
+    if normalized.startswith(_CLIENT_BODY_BLOCKED_PREFIXES):
+        return False
+    parts = [part for part in normalized.split("/") if part]
+    if not parts or any(part in _CLIENT_BODY_BLOCKED_PARTS for part in parts):
+        return False
+    name = parts[-1]
+    blocked_names = (LAUNCHER_EXE_NAME, LAUNCHER_JSON_NAME, VERSION_NAME,
+                     APP_INFO_NAME, "app.info.bak_original", "check_health.bat")
+    if name in blocked_names or name in PLAYER_DOC_NAMES:
+        return False
+    if name.lower().endswith(_CLIENT_BODY_BLOCKED_SUFFIXES):
+        return False
+    return True
+
+
+def caches_rel_allowed(rel: str) -> bool:
+    """判断 bundle 增量清单路径是否形如 ``_Data/Caches/<名>/<哈希>/__data``。"""
+    normalized = rel.replace("\\", "/")
+    prefix = DATA_DIR_NAME + "/" + CACHE_DIR_NAME + "/"
+    if not normalized.startswith(prefix):
+        return False
+    tail = [part for part in normalized[len(prefix):].split("/") if part]
+    return len(tail) == 3 and tail[0] and tail[1] and tail[2] in ("__data", "__info")
+
+
+def _manifest_todo(game_dir: str, files: dict, checker) -> list:
+    """通用差量比对:列出清单里缺失或 md5 不同的路径(按路径排序)。"""
+    todo = []
+    for rel, expected in (files or {}).items():
+        if not checker(rel):
+            raise ValueError("更新清单含不允许的路径:%s" % rel)
+        target = rel_path_safe(game_dir, rel)
+        if target is None:
+            raise ValueError("更新清单路径不合法:%s" % rel)
+        if file_needs_update(target, expected):
+            todo.append(rel)
+    return sorted(todo)
+
+
+def client_body_todo(game_dir: str, files: dict) -> list:
+    """列出客户端本体需要安装的文件(缺失或 md5 不同)。"""
+    return _manifest_todo(game_dir, files, client_body_rel_allowed)
+
+
+def caches_added_todo(game_dir: str, files: dict) -> list:
+    """列出 bundle 缓存需要补充的文件(缺失或 md5 不同)。"""
+    return _manifest_todo(game_dir, files, caches_rel_allowed)
+
+
+def install_zip_members(zip_path: str, game_dir: str, mapping: dict, stamp: str,
+                        checker=None, backup: bool = False) -> list:
+    """按 ``相对路径 → md5`` 从 zip 安装文件,返回中文日志行列表。
+
+    先整体校验(成员齐全、路径合法、md5 相符)再逐个写入;任何一步失败抛
+    ``ValueError``,已写入的部分保留但不会留下半文件(单文件写入是原子的)。
+    """
+    mapping = dict(mapping or {})
+    if not mapping:
+        return []
+    logs = []
+    with zipfile.ZipFile(zip_path) as archive:
+        available = {
+            name.replace("\\", "/").rstrip("/")
+            for name in archive.namelist() if name.strip("/\\")
+        }
+        for rel in mapping:
+            normalized = rel.replace("\\", "/")
+            if normalized not in available:
+                raise ValueError("更新包缺少成员:%s" % rel)
+            if checker is not None and not checker(normalized):
+                raise ValueError("更新包成员路径不允许:%s" % rel)
+            if rel_path_safe(game_dir, normalized) is None:
+                raise ValueError("更新包成员路径不合法:%s" % rel)
+        for rel, expected in mapping.items():
+            normalized = rel.replace("\\", "/")
+            data = archive.read(normalized)
+            digest = hashlib.md5(data).hexdigest()
+            if digest != str(expected).lower():
+                raise ValueError("成员 md5 不符:%s" % rel)
+            target = rel_path_safe(game_dir, normalized)
+            install_bytes(target, data, expected, stamp, backup=backup)
+            logs.append("已更新 " + normalized)
+    return logs
+
+
+# ---------------------------------------------------------------- 进程
+
+def game_running() -> bool:
+    """游戏主进程是否在运行(用 PowerShell 探测,输出 ASCII 避免编码问题)。"""
+    command = ("if (Get-Process -Name '%s' -ErrorAction SilentlyContinue) "
+               "{ 'RUNNING' } else { 'IDLE' }" % GAME_PROCESS)
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "RUNNING" in (result.stdout or "")
+
+
+# ---------------------------------------------------------------- 配置
+
+def _read_cfg_lines(path: str) -> list:
+    """读配置文件为行列表;文件不存在时返回空列表。"""
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", encoding="utf-8", errors="replace") as config_file:
+        return config_file.read().splitlines()
+
+
+def _cfg_value(lines: list, key: str):
+    """取配置里某个键的最后一次赋值(原样字符串),找不到返回 None。"""
+    pattern = re.compile(r"^\s*%s\s*=\s*(.*?)\s*$" % re.escape(key), re.IGNORECASE)
+    found = None
+    for line in lines:
+        match = pattern.match(line)
+        if match:
+            found = match.group(1)
+    return found
+
+
+def offline_config_status(game_dir: str) -> tuple:
+    """检查配置是否处于离线档。
+
+    返回 ``(通过, 详情)``:所有 ``OFFLINE_KEYS`` 都命中期望值才通过;
+    未通过时详情列出第一个不符的键。
+    """
+    path = config_path(game_dir)
+    if not os.path.isfile(path):
+        return False, "配置文件缺失(应为离线档)"
+    lines = _read_cfg_lines(path)
+    for key, expected in OFFLINE_KEYS:
+        value = _cfg_value(lines, key)
+        if value is None:
+            return False, "缺少 %s = %s" % (key, expected)
+        if value.strip().lower() != expected:
+            return False, "%s = %s(应为 %s)" % (key, value.strip(), expected)
+    return True, "离线档配置完整(%d 项)" % len(OFFLINE_KEYS)
+
+
+def repair_config(game_dir: str, extra_defaults=None) -> str:
+    """把配置写入/修正为离线档,返回中文说明。
+
+    参数:extra_defaults 为额外的"键 → 值"字典(打包/修复时用于统一玩家默认值,
+        如 SkipDebug=false);会写到 [Offline] 段末尾(键已存在则原地改)。
+    说明:保留文件其它内容;文件缺失时新建最小配置。
+    """
+    path = config_path(game_dir)
+    lines = _read_cfg_lines(path)
+    settings = dict(OFFLINE_KEYS)
+    if extra_defaults:
+        settings.update(extra_defaults)
+
+    # 定位 [Offline] 段(没有就追加)
+    section_index = -1
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*\[Offline\]\s*$", line):
+            section_index = i
+            break
+    if section_index < 0:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("[Offline]")
+        section_index = len(lines) - 1
+
+    for key, value in settings.items():
+        hit = -1
+        for i, line in enumerate(lines):
+            if re.match(r"^\s*%s\s*=" % re.escape(key), line, re.IGNORECASE):
+                hit = i
+                break
+        if hit >= 0:
+            lines[hit] = "%s = %s" % (key, value)
+            continue
+        # 插到 [Offline] 段末尾(下一个段标题之前)
+        insert_at = len(lines)
+        for i in range(section_index + 1, len(lines)):
+            if re.match(r"^\s*\[", lines[i]):
+                insert_at = i
+                break
+        lines.insert(insert_at, "%s = %s" % (key, value))
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as config_file:
+        config_file.write("\n".join(lines) + "\n")
+    return "已写入离线档配置(%d 项)" % len(settings)
+
+
+# ---------------------------------------------------------------- 检查
+
+def _stories_status(path: str) -> tuple:
+    """检查 stories.json 是否存在且可解析,返回 ``(通过, 详情)``。"""
+    if not os.path.isfile(path):
+        return False, "stories.json 缺失"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        return False, "stories.json 无法解析:%s" % error
+    entries = data.get("stories") if isinstance(data, dict) else data
+    count = len(entries) if isinstance(entries, list) else 0
+    if count < STORIES_MIN_COUNT:
+        return False, "剧情条数偏少(%d)" % count
+    return True, "%d 条剧情" % count
+
+
+def _has_zone_stream(path: str) -> bool:
+    """判断文件是否真的能打开 ``Zone.Identifier`` 备用数据流。"""
+    try:
+        # Windows 对某些已解除标记的 ADS 路径仍会让 os.path.isfile 返回真；
+        # 只有实际打开该流成功，才能确认下载来源标记仍然存在。
+        with open(path + _ZONE_STREAM, "rb"):
+            return True
+    except OSError:
+        return False
+
+
+def _zone_check(paths: list) -> CheckItem:
+    """检查关键文件是否带有 Windows 下载来源标记(Zone.Identifier)。"""
+    marked = [path for path in paths if _has_zone_stream(path)]
+    if not marked:
+        return CheckItem("zone", True, "无 Zone.Identifier")
+    names = "、".join(os.path.basename(path) for path in marked)
+    return CheckItem("zone", False, "存在 Zone.Identifier:%s(点「修复」可解除)" % names)
+
+
+def _port_check() -> CheckItem:
+    """探测假 API 端口占用情况(占用只提示,不视为失败)。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(_PORT_TIMEOUT_SECONDS)
+            occupied = probe.connect_ex(("127.0.0.1", API_PORT)) == 0
+    except OSError as error:
+        return CheckItem("port", True, "端口 %d 无法探测(仅提示):%s" % (API_PORT, error))
+    if occupied:
+        return CheckItem("port", True, "端口 %d 已占用(仅提示:可能是残留进程)" % API_PORT)
+    return CheckItem("port", True, "端口 %d 未占用" % API_PORT)
+
+
+def cache_entry_count(game_dir: str) -> int:
+    """统计 ``_Data\\Caches`` 的顶层条目数(离线资源完整度指标)。"""
+    path = cache_dir(game_dir)
+    if not os.path.isdir(path):
+        return 0
+    try:
+        return len(os.listdir(path))
+    except OSError:
+        return 0
+
+
+def health_check(game_dir: str) -> list:
+    """检查离线启动所需的本机条件(不发网络请求)。"""
+    plugin = plugin_dir(game_dir)
+    exe = os.path.join(game_dir, EXE_NAME)
+    winhttp = os.path.join(game_dir, "winhttp.dll")
+    bep_core = os.path.join(game_dir, "BepInEx", "core")
+    dll = os.path.join(plugin, "StoryViewer.dll")
+    version = version_path(game_dir)
+
+    cfg_ok, cfg_detail = offline_config_status(game_dir)
+    stories_ok, stories_detail = _stories_status(stories_path(game_dir))
+
+    preview_count = 0
+    previews = previews_dir(game_dir)
+    if os.path.isdir(previews):
+        try:
+            preview_count = len(os.listdir(previews))
+        except OSError:
+            preview_count = 0
+
+    cache_count = cache_entry_count(game_dir)
+    if cache_count >= CACHE_MIN_ENTRIES:
+        cache_item = CheckItem("cache", True, "_Data\\Caches %d 个条目" % cache_count)
+    else:
+        cache_item = CheckItem("cache", False,
+                               "_Data\\Caches 仅 %d 个条目(需 ≥%d,缓存不完整请重新解压完整包)"
+                               % (cache_count, CACHE_MIN_ENTRIES))
+
+    _company, product = read_identity(game_dir)
+    if not product:
+        identity_item = CheckItem("identity", False, "app.info 缺失,无法确认离线身份")
+    elif product.endswith(IDENTITY_SUFFIX):
+        identity_item = CheckItem("identity", True, "离线身份 %s" % product)
+    else:
+        identity_item = CheckItem("identity", False,
+                                  "身份未隔离(%s;点「修复」自动处理)" % product)
+
+    seed_bin, seed_hash = seed_catalog_pair(game_dir)
+    if seed_bin and seed_hash:
+        catalog_item = CheckItem(
+            "catalog", True, "catalog 种子就绪(%s)" % (catalog_hash_text(seed_hash)[:12] or "无哈希"))
+    else:
+        catalog_item = CheckItem("catalog", False, "包内缺 catalog 种子(请重新解压完整包)")
+
+    return [
+        CheckItem("exe", os.path.isfile(exe),
+                  "主程序存在" if os.path.isfile(exe) else "缺少 %s(目录不对?)" % EXE_NAME),
+        CheckItem("winhttp.dll", os.path.isfile(winhttp),
+                  "注入入口存在" if os.path.isfile(winhttp) else "winhttp.dll 缺失,插件不会加载"),
+        CheckItem("BepInEx", os.path.isdir(bep_core),
+                  "运行时存在" if os.path.isdir(bep_core) else "BepInEx\\core 缺失"),
+        CheckItem("plugin", os.path.isfile(dll),
+                  "StoryViewer.dll 存在" if os.path.isfile(dll) else "StoryViewer.dll 缺失"),
+        CheckItem("stories.json", stories_ok, stories_detail),
+        CheckItem("previews", preview_count > 0, "%d 张封面" % preview_count if preview_count
+                  else "previews 目录缺失或为空"),
+        CheckItem("cfg", cfg_ok, cfg_detail),
+        identity_item,
+        catalog_item,
+        cache_item,
+        _zone_check([exe, winhttp, dll]),
+        _port_check(),
+        CheckItem("version", os.path.isfile(version),
+                  "版本文件存在" if os.path.isfile(version) else "offline_version.json 缺失"),
+    ]
+
+
+# ---------------------------------------------------------------- 修复
+
+def _unblock_game_files(game_dir: str) -> tuple:
+    """用 PowerShell 解除游戏目录下文件的 Zone.Identifier。"""
+    safe_dir = game_dir.replace("'", "''")
+    command = "Get-ChildItem -LiteralPath '%s' -Recurse -File | Unblock-File" % safe_dir
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", command],
+                       check=True, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
+    return True, ""
+
+
+def _archive_big_log(path: str, stamp: str) -> str:
+    """日志超过阈值时改名归档,返回中文说明或空串。"""
+    if not os.path.isfile(path) or os.path.getsize(path) <= LOG_ARCHIVE_BYTES:
+        return ""
+    archived = path + ".old_" + stamp
+    try:
+        os.replace(path, archived)
+    except OSError as error:
+        return "日志归档失败(%s):%s" % (os.path.basename(path), error)
+    return "已归档超大日志 %s" % os.path.basename(archived)
+
+
+def safe_repair(game_dir: str) -> list:
+    """修复可本地恢复的离线启动条件(不联网),返回中文日志行。"""
+    logs = []
+    unblock_ok, unblock_detail = _unblock_game_files(game_dir)
+    if unblock_ok:
+        logs.append("已解除游戏文件的 Zone.Identifier")
+    else:
+        logs.append("解除 Zone.Identifier 失败(可忽略):" + unblock_detail)
+
+    logs.append(repair_config(game_dir))
+
+    logs.append(ensure_offline_identity(game_dir))
+    logs.extend(seed_catalog_to_local_low(game_dir))
+    logs.extend(seed_local_low_extras(game_dir))
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    for name in ("LogOutput.log", "ErrorLog.log"):
+        line = _archive_big_log(os.path.join(logs_dir(game_dir), name), stamp)
+        if line:
+            logs.append(line)
+
+    if os.path.isfile(version_path(game_dir)):
+        data = load_version(game_dir)
+        if not data.get("first_ready"):
+            data["first_ready"] = True
+            save_version(game_dir, data)
+            logs.append("已将 first_ready 设为 true")
+    return logs
+
+
+# ---------------------------------------------------------------- 探针
+
+def index_probe(game_dir: str) -> list:
+    """索引探针:验证剧情索引/封面/配置/端口,不启动游戏。"""
+    items = []
+
+    cfg_ok, cfg_detail = offline_config_status(game_dir)
+    items.append(ProbeItem("cfg", cfg_ok, cfg_detail))
+
+    stories = stories_path(game_dir)
+    if not os.path.isfile(stories):
+        items.append(ProbeItem("stories.json", False, "缺失"))
+    else:
+        try:
+            with open(stories, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            entries = data.get("stories") if isinstance(data, dict) else data
+            entries = entries if isinstance(entries, list) else []
+            by_prefix = {prefix: 0 for prefix in _STORIES_PREFIXES}
+            other = 0
+            for entry in entries:
+                key = ""
+                if isinstance(entry, dict):
+                    key = str(entry.get("k") or entry.get("key") or "")
+                matched = False
+                for prefix in _STORIES_PREFIXES:
+                    if key.startswith(prefix):
+                        by_prefix[prefix] += 1
+                        matched = True
+                        break
+                if not matched:
+                    other += 1
+            detail = "、".join("%s %d" % (p.rstrip("_"), by_prefix[p]) for p in _STORIES_PREFIXES)
+            detail += "(其它 %d)" % other
+            items.append(ProbeItem("stories.json", len(entries) >= STORIES_MIN_COUNT,
+                                   "共 %d 条:%s" % (len(entries), detail)))
+        except (OSError, json.JSONDecodeError) as error:
+            items.append(ProbeItem("stories.json", False, "无法解析:%s" % error))
+
+    previews = previews_dir(game_dir)
+    preview_count = len(os.listdir(previews)) if os.path.isdir(previews) else 0
+    items.append(ProbeItem("previews", preview_count > 0, "%d 张封面" % preview_count))
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", API_PORT))
+        items.append(ProbeItem("port", True, "%d 可绑定(启动游戏后可起本地服务)" % API_PORT))
+    except OSError as error:
+        items.append(ProbeItem("port", False,
+                               "%d 被占用(关闭残留进程后重试):%s" % (API_PORT, error)))
+    return items
+
+
+# ---------------------------------------------------------------- 更新辅助
+
+def parse_latest_release(payload: dict) -> dict:
+    """从 GitHub Release API 结果里抽取更新附件地址。
+
+    返回:``{"tag": str, "assets_by_name": {name: url}, <各键>: url|None}``。
+    """
+    release = {"tag": payload.get("tag_name"), "assets_by_name": {}}
+    for key in _ASSET_URL_KEYS.values():
+        release[key] = None
+    for asset in payload.get("assets") or []:
+        name = (asset or {}).get("name") or ""
+        url = (asset or {}).get("browser_download_url")
+        if name and url:
+            release["assets_by_name"][name] = url
+        key = _ASSET_URL_KEYS.get(name)
+        if key:
+            release[key] = url
+    return release
+
+
+def baseline_mismatch(local: dict, remote: dict) -> bool:
+    """本地与远端基线是否不一致(不一致必须重装完整包,不接受增量更新)。
+
+    基线为打包日冻结的完整包标识;两端都缺(旧版文件)视为一致,便于开发期。
+    """
+    return str((local or {}).get("baseline") or "") != str((remote or {}).get("baseline") or "")
+
+
+def read_github_repo(game_dir: str) -> str:
+    """读取游戏根 ``launcher.json`` 的 ``github_repo``(未配置返回空串)。"""
+    path = launcher_json_path(game_dir)
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return str((data or {}).get("github_repo") or "").strip()
+    except (OSError, json.JSONDecodeError):
+        return ""
