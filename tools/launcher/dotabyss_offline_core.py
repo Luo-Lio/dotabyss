@@ -61,7 +61,7 @@ OFFLINE_KEYS = (
     ("CaptureForward", "false"),
 )
 
-# 判定"缓存完整"的下限:当前客户端 _Data\\Caches 顶层 21813 个条目,
+# 判定"缓存完整"的下限:当前客户端 _Data\\Caches 顶层约 22506 个缓存目录,
 # 阈值取 10000,给未来结构调整留余量;明显偏低说明没拷全(会黑屏)。
 CACHE_MIN_ENTRIES = 10000
 # stories.json 至少要有的剧情条数(当前 1229)。
@@ -86,6 +86,7 @@ _ASSET_URL_KEYS = {
     CATALOG_HASH_NAME: "catalog_hash_url",
     "client_body.zip": "client_body_zip_url",
     "caches_update.zip": "caches_zip_url",
+    "master_data.zip": "master_data_url",
 }
 
 # 更新包里允许落地的玩家文档(白名单,防止 zip 混入任意文件)。
@@ -425,9 +426,11 @@ def seed_catalog_to_local_low(game_dir: str, base: str = "") -> list:
 
 
 def seed_local_low_extras(game_dir: str, base: str = "") -> list:
-    """把包内 LocalLow 附属种子(如 ``AbsfRuntimeConfig.dat``)补进离线存档目录。
+    """把包内 LocalLow 附属种子补进离线存档目录。
 
-    规则:只补"目标不存在"的文件,绝不覆盖玩家已有文件;返回中文日志行列表。
+    种子目录允许包含子目录(当前包括 ``DownloadCache/*.dat`` 主数据)。
+    规则:普通附属文件只补"目标不存在"、绝不覆盖;主数据 ``DownloadCache/*.dat``
+    在目标缺失或内容不一致时替换;返回中文日志行列表。
     """
     source = local_low_seed_dir(game_dir)
     if not os.path.isdir(source):
@@ -436,18 +439,45 @@ def seed_local_low_extras(game_dir: str, base: str = "") -> list:
     if not target:
         return ["无法确定存档目录(app.info 缺失),附属种子未播种"]
     lines = []
-    for name in sorted(os.listdir(source)):
-        src = os.path.join(source, name)
-        dest = os.path.join(target, name)
-        if not os.path.isfile(src) or os.path.isfile(dest):
-            continue
-        try:
-            os.makedirs(target, exist_ok=True)
-            shutil.copy2(src, dest)
-            lines.append("已补种存档目录文件 %s" % name)
-        except OSError as error:
-            lines.append("补种 %s 失败:%s" % (name, error))
+    for root, _dirs, names in os.walk(source):
+        relative_root = os.path.relpath(root, source)
+        for name in sorted(names):
+            relative = name if relative_root == "." else os.path.join(relative_root, name)
+            src = os.path.join(source, relative)
+            dest = os.path.join(target, relative)
+            normalized = relative.replace("\\", "/")
+            # 只有主数据 .dat 允许按版本内容替换;DownloadCache 下其它玩家文件仍不覆盖。
+            is_master_data = master_data_rel_allowed(normalized)
+            if os.path.isfile(dest):
+                if not is_master_data:
+                    continue
+                # 主数据是版本化缓存:同一路径若内容残缺或过期必须替换;
+                # 其它 LocalLow 文件仍保持“只补缺失、不覆盖”约定。
+                try:
+                    same = (os.path.getsize(src) == os.path.getsize(dest)
+                            and file_md5(src) == file_md5(dest))
+                except OSError:
+                    same = False
+                if same:
+                    continue
+            parent = os.path.dirname(dest)
+            try:
+                os.makedirs(parent, exist_ok=True)
+                shutil.copy2(src, dest)
+                prefix = "已更新主数据缓存" if is_master_data else "已补种存档目录文件"
+                lines.append("%s %s" % (prefix, normalized))
+            except OSError as error:
+                prefix = "更新主数据缓存" if is_master_data else "补种"
+                lines.append("%s %s 失败:%s" % (prefix, normalized, error))
     return lines
+
+
+def master_data_rel_allowed(rel: str) -> bool:
+    """判断主数据附件路径是否为 ``DownloadCache/<name>.dat``。"""
+    normalized = (rel or "").replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    return (len(parts) == 2 and parts[0] == "DownloadCache"
+            and parts[1].lower().endswith(".dat"))
 
 
 def install_catalog_from_bytes(game_dir: str, raw_bin: bytes, raw_hash: bytes,
@@ -854,12 +884,17 @@ def _port_check() -> CheckItem:
 
 
 def cache_entry_count(game_dir: str) -> int:
-    """统计 ``_Data\\Caches`` 的顶层条目数(离线资源完整度指标)。"""
+    """统计 ``_Data\\Caches`` 的顶层缓存目录数(离线资源完整度指标)。
+
+    ``Caches\\__info`` 是 Unity 的合法元数据文件,不是 bundle 条目;只数目录
+    可使输出与维护流程中的缓存目录统计一致。
+    """
     path = cache_dir(game_dir)
     if not os.path.isdir(path):
         return 0
     try:
-        return len(os.listdir(path))
+        return sum(1 for name in os.listdir(path)
+                   if os.path.isdir(os.path.join(path, name)))
     except OSError:
         return 0
 

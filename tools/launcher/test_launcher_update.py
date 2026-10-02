@@ -183,11 +183,24 @@ class UpdateFlowTest(unittest.TestCase):
             self.app._do_update()
         self.assertIn("游戏运行中", self._drain())
 
-    def test_up_to_date(self):
+    def test_up_to_date_when_declared_outputs_match(self):
         self._set_repo()
         self._make_app()
         release = self._release_payload()
         remote = self._remote_version(version="20250101")  # 与本地相同
+        # 该旧夹具的封面/文档 zip 不是完整发布包,本用例只验证核心文件一致时的同版本判定。
+        remote.pop("previews_zip_md5", None)
+        remote.pop("player_docs_zip_md5", None)
+        self._write(("BepInEx", "plugins", "StoryViewer", "StoryViewer.dll"), self.NEW_DLL)
+        self._write(("BepInEx", "plugins", "StoryViewer", "stories.json"), self.NEW_STORIES)
+        local = core.load_version(self.game)
+        local.update({
+            "plugin_md5": remote["plugin_md5"],
+            "stories_md5": remote["stories_md5"],
+            "launcher_md5": _md5(self.NEW_LAUNCHER),
+        })
+        core.save_version(self.game, local)
+        remote["launcher_md5"] = _md5(self.NEW_LAUNCHER)
         with mock.patch.object(launcher, "_http_get", self._fake_http(release, remote)):
             self.app._do_update()
         self.assertIn("已是最新。", self._drain())
@@ -295,6 +308,50 @@ class VersionLabelTest(unittest.TestCase):
     def test_missing_everything(self):
         self.assertEqual(launcher._plugin_version_hint(self.tmp.name), "")
 
+    def test_short_plugin_version_removes_source_revision(self):
+        """带 .NET source revision 的版本只保留基础版本。"""
+        self.assertEqual(
+            launcher.short_plugin_version(
+                "0.7.18+736c5188d8cde3dddc0289a57ec09263b58c987e"),
+            "0.7.18")
+
+    def test_short_plugin_version_keeps_clean_version(self):
+        """无 source revision 的短版本保持原样。"""
+        self.assertEqual(launcher.short_plugin_version("0.7.18"), "0.7.18")
+
+    def test_short_plugin_version_truncates_long_plain_value(self):
+        """没有加号但超过显示上限的版本也不能撑破顶栏。"""
+        result = launcher.short_plugin_version("123456789012345678901234567890")
+        self.assertEqual(result, "12345678901234567890123…")
+        self.assertTrue(result.endswith("…"))
+
+    def test_short_plugin_version_empty_values(self):
+        """空字符串和 None 均返回空显示值。"""
+        self.assertEqual(launcher.short_plugin_version(""), "")
+        self.assertEqual(launcher.short_plugin_version(None), "")
+
+    def test_short_plugin_version_empty_base_is_safe(self):
+        """加号位于开头时不抛异常且返回空值。"""
+        self.assertEqual(launcher.short_plugin_version("+abc"), "")
+
+    def test_startup_logs_full_plugin_version_once(self):
+        """启动顶栏显示短版本,日志只记录一次完整版本。"""
+        game = self.tmp.name
+        core.save_version(game, {
+            "version": "20261002",
+            "plugin_version": "0.7.18+736c5188d8cde3dddc0289a57ec09263b58c987e",
+        })
+        import tkinter as tk
+        root = tk.Tk()
+        try:
+            app = launcher.App(root, game_dir=game, smoke_out="unused-smoke.txt")
+            app._poll_queue()
+            log_text = app.txt.get("1.0", "end")
+            self.assertEqual(app._version_text(), "离线包 20261002\n插件 v0.7.18")
+            self.assertEqual(log_text.count("插件完整版本: 0.7.18+736c5188d8cde3dddc0289a57ec09263b58c987e"), 1)
+        finally:
+            root.destroy()
+
 
 class ChannelUpdateFlowTest(unittest.TestCase):
     """新通道:baseline 门禁、client_body、caches_added、catalog、静默更新检查。"""
@@ -311,6 +368,8 @@ class ChannelUpdateFlowTest(unittest.TestCase):
     OLD_CATALOG = b"OLD-CATALOG-BIN"
     NEW_CATALOG = b"NEW-CATALOG-BIN"
     NEW_CATALOG_HASH = "newcataloghash0123456789abcdef"
+    NEW_MASTER_DATA = b"master-data-new"
+    MASTER_REL = "DownloadCache/4258a98cad2950fb53a8f5ecba8767f2.dat"
 
     CACHE_REL = "ドットアビスX_Data/Caches/bundleA/h1/__data"
     MANAGED_REL = "ドットアビスX_Data/Managed/Assembly-CSharp.dll"
@@ -401,6 +460,14 @@ class ChannelUpdateFlowTest(unittest.TestCase):
         """bundle 增量包。"""
         return _zip([(self.CACHE_REL, self.NEW_BUNDLE)])
 
+    def _master_data_zip(self):
+        """主数据增量附件。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            info = zipfile.ZipInfo(self.MASTER_REL, date_time=(2020, 1, 1, 0, 0, 0))
+            archive.writestr(info, self.NEW_MASTER_DATA)
+        return buffer.getvalue()
+
     def _release(self, include_catalog=True):
         """Release API 附件表。"""
         assets = [
@@ -410,6 +477,7 @@ class ChannelUpdateFlowTest(unittest.TestCase):
             {"name": core.LAUNCHER_EXE_NAME, "browser_download_url": "http://x/launcher.exe"},
             {"name": "client_body.zip", "browser_download_url": "http://x/client_body.zip"},
             {"name": "caches_update.zip", "browser_download_url": "http://x/caches_update.zip"},
+            {"name": "master_data.zip", "browser_download_url": "http://x/master_data.zip"},
         ]
         if include_catalog:
             assets += [
@@ -423,6 +491,7 @@ class ChannelUpdateFlowTest(unittest.TestCase):
         """version.json 内容(默认是一次完整可成功的更新)。"""
         body_zip = self._client_body_zip()
         caches_zip = self._caches_zip()
+        master_zip = self._master_data_zip()
         data = {
             "version": "20260925",
             "baseline": "20250101",
@@ -447,6 +516,9 @@ class ChannelUpdateFlowTest(unittest.TestCase):
                 "bytes": len(caches_zip),
                 "files": {self.CACHE_REL: _md5(self.NEW_BUNDLE)},
             },
+            "master_data_url": "master_data.zip",
+            "master_data_md5": _md5(master_zip),
+            "master_data_files": {self.MASTER_REL: _md5(self.NEW_MASTER_DATA)},
         }
         data.update(over)
         return data
@@ -462,6 +534,7 @@ class ChannelUpdateFlowTest(unittest.TestCase):
             "http://x/launcher.exe": b"old-launcher",
             "http://x/client_body.zip": self._client_body_zip(),
             "http://x/caches_update.zip": self._caches_zip(),
+            "http://x/master_data.zip": self._master_data_zip(),
             "http://x/catalog_1.bin": self.NEW_CATALOG,
             "http://x/catalog_1.bin.hash": self.NEW_CATALOG_HASH.encode("utf-8"),
         }
@@ -501,6 +574,27 @@ class ChannelUpdateFlowTest(unittest.TestCase):
                 mock.patch.object(launcher, "_http_download", download):
             self.app._do_update()
         return self._drain()
+
+    def _run_update_with_asset_calls(self, release, remote):
+        """运行更新并返回日志、实际访问的 Release 资产 URL。"""
+        get, download = self._fake_http(release, remote)
+        calls = []
+
+        def counted_get(url, timeout=60):
+            """记录非 version.json 的资产 GET。"""
+            if url.startswith("http://x/") and url != "http://x/version.json":
+                calls.append(url)
+            return get(url, timeout)
+
+        def counted_download(url, dest, timeout=600, chunk=1 << 20):
+            """记录 zip 资产下载。"""
+            calls.append(url)
+            return download(url, dest, timeout, chunk)
+
+        with mock.patch.object(launcher, "_http_get", counted_get), \
+                mock.patch.object(launcher, "_http_download", counted_download):
+            self.app._do_update()
+        return self._drain(), calls
 
     # ------------------------------------------------------------ 用例
 
@@ -549,6 +643,75 @@ class ChannelUpdateFlowTest(unittest.TestCase):
         self.assertEqual(data["baseline"], "20250101")
         self.assertEqual(data["channel"], "baseline")
         self.assertEqual(data["catalog_hash"], self.NEW_CATALOG_HASH)
+
+    def test_master_data_update_repairs_old_player_without_seed_dir(self):
+        """增量更新应为旧完整包创建种子并把主数据播种到 LocalLow。"""
+        self._set_repo()
+        self._make_app()
+        logs = self._run_update(self._release(), self._remote())
+
+        seed_path = os.path.join(core.local_low_seed_dir(self.game), *self.MASTER_REL.split("/"))
+        local_path = os.path.join(core.local_low_dir(self.game), *self.MASTER_REL.split("/"))
+        self.assertIn("主数据", logs)
+        self.assertEqual(self._read(tuple(["BepInEx", "plugins", "StoryViewer", "local_low_seed"]
+                                          + self.MASTER_REL.split("/"))), self.NEW_MASTER_DATA)
+        with open(local_path, "rb") as handle:
+            self.assertEqual(handle.read(), self.NEW_MASTER_DATA)
+
+    def test_master_data_attachment_missing_fails_closed(self):
+        """version.json 声明主数据时,Release 缺附件不能静默完成版本更新。"""
+        self._set_repo()
+        self._make_app()
+        release = self._release()
+        release["assets"] = [asset for asset in release["assets"]
+                             if asset["name"] != "master_data.zip"]
+        logs = self._run_update(release, self._remote())
+        self.assertIn("主数据附件", logs)
+        self.assertEqual(core.load_version(self.game)["version"], "20250101")
+
+    def test_same_version_missing_master_state_still_repairs_master_data(self):
+        """版本号已相同但主数据状态缺失时,仍下载并播种主数据。"""
+        self._set_repo()
+        self._make_app()
+        release = self._release()
+        remote = self._remote()
+        self._run_update(release, remote)
+
+        local = core.load_version(self.game)
+        local.pop("master_data_md5", None)
+        core.save_version(self.game, local)
+        seed_file = os.path.join(core.local_low_seed_dir(self.game), *self.MASTER_REL.split("/"))
+        os.remove(seed_file)
+
+        logs, calls = self._run_update_with_asset_calls(release, remote)
+
+        self.assertIn("主数据", logs)
+        self.assertIn("http://x/master_data.zip", calls)
+        self.assertTrue(os.path.isfile(seed_file))
+
+    def test_same_version_with_matching_declared_outputs_does_not_download(self):
+        """版本号与 Release 声明的产物均一致时,不再发起资产下载。"""
+        self._set_repo()
+        self._make_app()
+        release = self._release()
+        remote = self._remote()
+        self._run_update(release, remote)
+
+        local = core.load_version(self.game)
+        local.update({
+            "plugin_md5": remote["plugin_md5"],
+            "stories_md5": remote["stories_md5"],
+            "catalog_hash": remote["catalog_hash"],
+            "catalog_bin_md5": remote["catalog_bin_md5"],
+            "master_data_md5": remote["master_data_md5"],
+            "version": remote["version"],
+        })
+        core.save_version(self.game, local)
+
+        logs, calls = self._run_update_with_asset_calls(release, remote)
+
+        self.assertIn("已是最新", logs)
+        self.assertEqual(calls, [])
 
     def test_client_body_md5_mismatch_blocks_version(self):
         self._set_repo()
@@ -612,6 +775,46 @@ class ChannelUpdateFlowTest(unittest.TestCase):
         self.assertEqual(str(self.app.btn_update["text"]), "有更新")
         self.assertIn("发现新版本", self._log_text())
 
+    def test_quiet_same_version_missing_master_record_sets_update_button(self):
+        """同版本但主数据记录缺失时,静默检查必须提示补齐。"""
+        self._set_repo()
+        self._make_app()
+        release = self._release()
+        remote = self._remote()
+        self._run_update(release, remote)
+
+        local = core.load_version(self.game)
+        self.assertEqual(local["version"], remote["version"])
+        local.pop("master_data_md5", None)
+        core.save_version(self.game, local)
+
+        with mock.patch.object(launcher.App, "_fetch_remote",
+                               lambda self_: (release, remote)):
+            self.app._check_update_quiet()
+        self.app._poll_queue()
+
+        self.assertEqual(str(self.app.btn_update["text"]), "有更新")
+        self.assertIn("本地产物未完全就绪", self._log_text())
+
+    def test_quiet_same_version_with_all_records_ready_is_silent(self):
+        """同版本且记录、主数据种子均就绪时,静默检查不改文案也不提示。"""
+        self._set_repo()
+        self._make_app()
+        release = self._release()
+        remote = self._remote()
+        self._run_update(release, remote)
+        before_text = str(self.app.btn_update["text"])
+        before_log = self._log_text()
+
+        with mock.patch.object(launcher.App, "_fetch_remote",
+                               lambda self_: (release, remote)):
+            self.app._check_update_quiet()
+        self.app._poll_queue()
+
+        self.assertEqual(str(self.app.btn_update["text"]), before_text)
+        self.assertEqual(self._log_text(), before_log)
+        self.assertEqual(self._drain(), "")
+
     def test_quiet_check_baseline_mismatch_sets_reinstall(self):
         self._set_repo()
         self._make_app()
@@ -650,6 +853,7 @@ class ChannelUpdateFlowTest(unittest.TestCase):
             "launcher.exe": b"old-launcher",
             "client_body.zip": self._client_body_zip(),
             "caches_update.zip": self._caches_zip(),
+            "master_data.zip": self._master_data_zip(),
             core.CATALOG_BIN_NAME: self.NEW_CATALOG,
             core.CATALOG_HASH_NAME: self.NEW_CATALOG_HASH.encode("utf-8"),
         }

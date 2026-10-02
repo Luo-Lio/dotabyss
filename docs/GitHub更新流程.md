@@ -10,8 +10,8 @@
 启动器 → GET api.github.com/repos/<repo>/releases/latest
        → 读附件 version.json(版本号 + 基线 + 各资产 md5 + 文件清单)
        → 基线比对(不一致 → 「需重装」,拒绝增量)
-       → 版本比对(相同 → 「已是最新」)
-       → 按需执行:client_body → caches_added → catalog → stories → previews → DLL → 文档 → 启动器
+       → 版本比对 + 本地产物核对(全部匹配且相同 → 「已是最新」)
+       → 按需执行:client_body → caches_added → master_data → catalog → stories → previews → DLL → 文档 → 启动器
        → 每步校验 md5 后落盘;全部成功才写 offline_version.json;换了启动器则自替换重启
 ```
 
@@ -34,10 +34,12 @@
 | `catalog_1.bin` + `catalog_1.bin.hash` | 资源 catalog 与哈希 | 包内 `catalog_seed\` + 存档 LocalLow | 13 MB |
 | `client_body.zip` | 客户端本体(相对完整包的差异文件集,清单在 `version.json`) | 游戏根(只装 md5 不同的文件) | 现包 180 MB |
 | `caches_update.zip` | 素材增量(新角色/新剧情 bundle) | `_Data\Caches`(清单在 `version.json`) | 视内容,通常几十 MB |
+| `master_data.zip` | 主数据缓存(`DownloadCache/*.dat`) | 包内 `local_low_seed\DownloadCache\` + 离线 LocalLow | 约 11 MB |
 
 > 附件名是启动器的识别依据,大小写敏感;**缺哪个就跳过哪一步**,不会中止整个更新。
 > 但**声明了内容却缺附件**会失败关闭(如 `version.json` 里有 `catalog_hash` 但没有
-> `catalog_1.bin`),避免"版本号写了、内容没装"的半吊子状态。
+> `catalog_1.bin`);`version.json` 声明 `master_data_files` 时缺 `master_data.zip` 也会失败,
+> 避免"版本号写了、内容没装"的半吊子状态。
 
 ## 3. `version.json` 字段
 
@@ -56,6 +58,11 @@
   "catalog_hash": "…",                // catalog 哈希文本(版本标识)
   "catalog_bin_md5": "…",             // catalog_1.bin
   "catalog_hash_md5": "…",            // catalog_1.bin.hash
+  "master_data_url": "master_data.zip", // 主数据附件名
+  "master_data_md5": "…",              // master_data.zip
+  "master_data_files": {                 // DownloadCache/*.dat 清单
+    "DownloadCache/<哈希>.dat": "…"
+  },
   "client_body": {                    // 客户端本体清单
     "zip": "client_body.zip", "zip_md5": "…", "bytes": 123,
     "files": { "ドットアビスX_Data/Managed/Assembly-CSharp.dll": "…" }
@@ -67,7 +74,8 @@
 }
 ```
 
-- **同版本号 = 已是最新**:内容有改动也必须把 `version` 往后调(日期递增)。
+- **同版本号且所有已声明产物均匹配 = 已是最新**:启动器会核对本地产物与种子;
+  即使版本号相同,缺失或 MD5 不符仍会继续修复。内容有改动时仍必须把 `version` 往后调(日期递增)。
 - **`baseline` 一旦发布就不要改**,除非确实要让老玩家重装完整包(见 §7)。
 - md5 任一不符 → 该步失败只打红字、**不写版本号**,可重试(已装部分保留)。
 - 客户端本体清单**不含**插件目录、`_Data\Caches`、`app.info`、启动器 exe 与文档
@@ -82,7 +90,9 @@
 # 1. 在 client\ 里把该更新的都更新好(插件编译部署、stories.json/封面重导、必要时重新冻结启动器)
 
 # 2. 若游戏本体或素材有更新:重打完整包(它同时产出 local_low_seed\ 与 catalog_seed\)
-D:\Python\python.exe tools\launcher\build_full_pack.py --recopy --zip
+#    ⚠️ 必须显式带 --repo:不带时它取「源包」的 github_repo,而本机 dist 包的该字段可能是空的
+#    (20261002 复核时实测就是空),会把空仓库写进新完整包 → 新装玩家永远无法更新。
+D:\Python\python.exe tools\launcher\build_full_pack.py --recopy --zip --repo Luo-Lio/dotabyss
 
 # 3. 生成发布附件到 dist\release_<版本>\(素材增量用 --caches-since 指旧包目录)
 D:\Python\python.exe tools\launcher\build_github_pack.py --version 20260925 --notes "新增 XX 剧情"
@@ -107,7 +117,7 @@ DotabyssOfflineLauncher.exe --game-dir <旧包目录> --release-dir <发布目�
 期望结果(用新版启动器跑):
 
 1. 首次:输出 `OK-RESTART`(或 `OK`,若本次不含启动器更新),日志逐条走
-   `client_body → caches_added → catalog → stories → previews → DLL → 文档 → 启动器`;
+   `client_body → caches_added → master_data → catalog → stories → previews → DLL → 文档 → 启动器`;
 2. 再跑一次:输出 `OK-UPTODATE`;
 3. 把发布目录的 `baseline` 改掉再跑:`BLOCKED-BASELINE`,且包内版本文件不变;
 4. 检查 `.new` 是否被替换、`app.info` 是否仍是 `*_offline`、`_Data\Caches` 是否新增了 bundle。

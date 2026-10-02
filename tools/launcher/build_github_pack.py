@@ -18,6 +18,7 @@
   catalog_1.bin.hash          catalog 哈希
   client_body.zip             客户端本体(相对完整包的差异文件集,启动器按 md5 只装缺的)
   caches_update.zip           素材增量(仅 --caches-since 时;新角色/新剧情 bundle)
+  master_data.zip             主数据缓存(DownloadCache/*.dat,每次发布必带)
 
 上传:把该目录里全部文件作为同一 Release 的附件(名字必须与上面完全一致);
 同版本号会被启动器视为「已是最新」,重发必须换版本号。
@@ -72,6 +73,29 @@ def _copy_file(path: str, out_dir: str) -> str:
     return target
 
 
+def _zip_master_data(seed_dir: str, zip_path: str) -> dict:
+    """把完整包内主数据种子打成 ``DownloadCache/*.dat`` 附件并返回清单。"""
+    source = os.path.join(seed_dir, "DownloadCache")
+    if not os.path.isdir(source):
+        raise ValueError("完整包缺少主数据种子目录:%s" % source)
+    files = {}
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+        for root, _dirs, names in os.walk(source):
+            for name in sorted(names):
+                if not name.lower().endswith(".dat"):
+                    continue
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, seed_dir).replace("\\", "/")
+                if not core.master_data_rel_allowed(rel):
+                    raise ValueError("主数据种子含非法路径:%s" % rel)
+                files[rel] = core.file_md5(path)
+                archive.write(path, rel)
+    if not files:
+        raise ValueError("主数据种子目录没有 .dat 文件:%s" % source)
+    return {"zip": "master_data.zip", "zip_md5": core.file_md5(zip_path),
+            "bytes": os.path.getsize(zip_path), "files": files}
+
+
 def _fail(message: str) -> int:
     """打印失败原因并返回 1。"""
     print("[ABORT] " + message)
@@ -107,6 +131,20 @@ def main() -> int:
             return _fail("缺少 %s:%s" % (label, path))
     if not (seed_bin and seed_hash):
         return _fail("完整包内缺 catalog 种子(先生成完整包):%s" % core.catalog_seed_dir(pack))
+    master_data_path = os.path.join(out_dir, "master_data.zip")
+    # 失败时清掉旧附件,避免复用旧 Release 目录里的过期主数据包。
+    try:
+        os.remove(master_data_path)
+    except FileNotFoundError:
+        pass
+    try:
+        master_data = _zip_master_data(core.local_low_seed_dir(pack), master_data_path)
+    except (OSError, ValueError) as error:
+        try:
+            os.remove(master_data_path)
+        except OSError:
+            pass
+        return _fail(str(error))
 
     stories_ok, stories_detail = core._stories_status(stories)
     if not stories_ok:
@@ -138,6 +176,8 @@ def main() -> int:
     docs_zip = os.path.join(out_dir, "player_docs.zip")
     _zip_files(docs_paths, docs_zip)
     print("[zip] player_docs.zip:%d 个文件" % len(docs_paths))
+    print("[zip] master_data.zip:%d 个主数据文件(%.1f MB)"
+          % (len(master_data["files"]), master_data["bytes"] / 1048576.0))
 
     version = {
         "version": args.version,
@@ -153,11 +193,15 @@ def main() -> int:
         "catalog_hash": core.catalog_hash_text(seed_hash),
         "catalog_bin_md5": core.file_md5(seed_bin),
         "catalog_hash_md5": core.file_md5(seed_hash),
+        "master_data_url": "master_data.zip",
+        "master_data_md5": master_data["zip_md5"],
+        "master_data_files": master_data["files"],
     }
 
     names = ["version.json", "StoryViewer.dll", "stories.json",
              "DotabyssOfflineLauncher.exe", "previews.zip", "player_docs.zip",
              core.CATALOG_BIN_NAME, core.CATALOG_HASH_NAME]
+    names.append("master_data.zip")
 
     if not args.no_client_body:
         body_files = pack_tools.client_body_files(pack)

@@ -190,22 +190,50 @@ def write_catalog_seed(out_dir: str, src: str, catalog_bin: str = "") -> str:
 
 # 附属运行时文件:新机器缺省时由启动器补种(只补缺失、不覆盖)。
 LOCAL_LOW_EXTRA_FILES = ("AbsfRuntimeConfig.dat",)
+LOCAL_LOW_MASTER_DATA_DIR = "DownloadCache"
+
+
+def _master_data_files(src: str) -> list:
+    """返回在线优先的 LocalLow 主数据文件路径列表。"""
+    app_dirs = [os.path.dirname(path) for path in core.local_low_catalog_dirs(src)]
+    for app_dir in reversed(app_dirs):
+        source_dir = os.path.join(app_dir, LOCAL_LOW_MASTER_DATA_DIR)
+        if not os.path.isdir(source_dir):
+            continue
+        files = [os.path.join(source_dir, name) for name in sorted(os.listdir(source_dir))
+                 if name.lower().endswith(".dat")
+                 and os.path.isfile(os.path.join(source_dir, name))]
+        if files:
+            return files
+    return []
 
 
 def write_local_low_seed(out_dir: str, src: str) -> list:
-    """把源机 LocalLow 的附属运行时文件放进包内 ``local_low_seed``(可选)。"""
+    """把源机 LocalLow 的运行时文件与主数据放进包内种子目录。
+
+    ``DownloadCache/*.dat`` 是游戏 ``MasterDataStore`` 的首下磁盘缓存;
+    不播种它时,新机器会在 ``MBuildings`` 等依赖主数据的路径上失败。
+    """
     app_dirs = [os.path.dirname(path) for path in core.local_low_catalog_dirs(src)]
     copied = []
+    target_dir = core.local_low_seed_dir(out_dir)
+    if os.path.isdir(target_dir):
+        shutil.rmtree(target_dir)
     for name in LOCAL_LOW_EXTRA_FILES:
         for app_dir in app_dirs:
             path = os.path.join(app_dir, name)
             if not os.path.isfile(path):
                 continue
-            target_dir = core.local_low_seed_dir(out_dir)
             os.makedirs(target_dir, exist_ok=True)
             shutil.copy2(path, os.path.join(target_dir, name))
             copied.append(name)
             break
+    # 优先在线身份目录:离线目录可能残留旧版主数据,不能遮蔽在线新版缓存。
+    for source in _master_data_files(src):
+        name = os.path.basename(source)
+        os.makedirs(os.path.join(target_dir, LOCAL_LOW_MASTER_DATA_DIR), exist_ok=True)
+        shutil.copy2(source, os.path.join(target_dir, LOCAL_LOW_MASTER_DATA_DIR, name))
+        copied.append(os.path.join(LOCAL_LOW_MASTER_DATA_DIR, name).replace("\\", "/"))
     return copied
 
 
@@ -316,8 +344,11 @@ def verify(out_dir: str, version: str, src: str) -> bool:
     check("baseline 已冻结", bool(data.get("baseline")), data.get("baseline") or "(空)")
     check("channel", bool(data.get("channel")), data.get("channel") or "(空)")
     check("无身份备份残留", not os.path.isfile(core.app_info_path(out_dir) + ".bak_original"))
-    extras = [name for name in LOCAL_LOW_EXTRA_FILES
-              if os.path.isfile(os.path.join(core.local_low_seed_dir(out_dir), name))]
+    seed_root = core.local_low_seed_dir(out_dir)
+    extras = []
+    for root, _dirs, names in os.walk(seed_root) if os.path.isdir(seed_root) else []:
+        for name in names:
+            extras.append(os.path.relpath(os.path.join(root, name), seed_root).replace("\\", "/"))
     print("[check] %-34s %s" % ("附属种子(可选)", "、".join(extras) if extras else "(无)"))
 
     leaks = []

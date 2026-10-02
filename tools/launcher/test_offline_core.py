@@ -53,6 +53,7 @@ class ParseLatestReleaseTest(unittest.TestCase):
             _asset("previews.zip", "http://x/previews.zip"),
             _asset("player_docs.zip", "http://x/docs.zip"),
             _asset(core.LAUNCHER_EXE_NAME, "http://x/launcher.exe"),
+            _asset("master_data.zip", "http://x/master_data.zip"),
         ]}
         parsed = core.parse_latest_release(payload)
         self.assertEqual(parsed["version_json_url"], "http://x/version.json")
@@ -61,6 +62,7 @@ class ParseLatestReleaseTest(unittest.TestCase):
         self.assertEqual(parsed["previews_zip_url"], "http://x/previews.zip")
         self.assertEqual(parsed["player_docs_url"], "http://x/docs.zip")
         self.assertEqual(parsed["launcher_exe_url"], "http://x/launcher.exe")
+        self.assertEqual(parsed["master_data_url"], "http://x/master_data.zip")
 
     def test_case_sensitive_names(self):
         payload = {"assets": [_asset("storyviewer.dll", "http://x/wrong")]}
@@ -512,6 +514,8 @@ class MiscTest(unittest.TestCase):
     def test_cache_entry_count_counts_top_level(self):
         for name in ("a", "b", "c"):
             os.makedirs(os.path.join(core.cache_dir(self.tmp.name), name))
+        with open(os.path.join(core.cache_dir(self.tmp.name), "__info"), "wb") as handle:
+            handle.write(b"unity metadata")
         self.assertEqual(core.cache_entry_count(self.tmp.name), 3)
 
     def test_read_github_repo_missing(self):
@@ -778,15 +782,39 @@ class CatalogSeedTest(unittest.TestCase):
         seed_dir = core.local_low_seed_dir(self.game)
         self._write(b"RUNTIME-CFG", os.path.join(seed_dir, "AbsfRuntimeConfig.dat"))
         self._write(b"EXTRA", os.path.join(seed_dir, "SomeOther.dat"))
+        self._write(b"MASTER-DATA", os.path.join(seed_dir, "DownloadCache", "master.dat"))
         lines = core.seed_local_low_extras(self.game)
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)
         with open(os.path.join(target, "AbsfRuntimeConfig.dat"), "rb") as handle:
             self.assertEqual(handle.read(), b"RUNTIME-CFG")
+        with open(os.path.join(target, "DownloadCache", "master.dat"), "rb") as handle:
+            self.assertEqual(handle.read(), b"MASTER-DATA")
         # 玩家已有文件绝不被覆盖
         self._write(b"PLAYER-OWN", os.path.join(target, "AbsfRuntimeConfig.dat"))
         self.assertEqual(core.seed_local_low_extras(self.game), [])
         with open(os.path.join(target, "AbsfRuntimeConfig.dat"), "rb") as handle:
             self.assertEqual(handle.read(), b"PLAYER-OWN")
+
+    def test_seed_master_data_replaces_old_cache_but_preserves_other_files(self):
+        """主数据缓存允许替换旧/残缺版本,其它 LocalLow 文件仍只补缺失。"""
+        target = core.local_low_dir(self.game)
+        seed_dir = core.local_low_seed_dir(self.game)
+        self._write(b"MASTER-NEW", os.path.join(seed_dir, "DownloadCache", "master.dat"))
+        self._write(b"MASTER-OLD", os.path.join(target, "DownloadCache", "master.dat"))
+        self._write(b"CACHE-PLAYER-NEW", os.path.join(seed_dir, "DownloadCache", "player.save"))
+        self._write(b"CACHE-PLAYER-OLD", os.path.join(target, "DownloadCache", "player.save"))
+        self._write(b"PLAYER-OLD", os.path.join(target, "player.save"))
+        self._write(b"PLAYER-NEW", os.path.join(seed_dir, "player.save"))
+
+        lines = core.seed_local_low_extras(self.game)
+
+        self.assertIn("主数据", " ".join(lines))
+        with open(os.path.join(target, "DownloadCache", "master.dat"), "rb") as handle:
+            self.assertEqual(handle.read(), b"MASTER-NEW")
+        with open(os.path.join(target, "DownloadCache", "player.save"), "rb") as handle:
+            self.assertEqual(handle.read(), b"CACHE-PLAYER-OLD")
+        with open(os.path.join(target, "player.save"), "rb") as handle:
+            self.assertEqual(handle.read(), b"PLAYER-OLD")
 
     def test_seed_local_low_extras_without_seed_dir_is_noop(self):
         self.assertEqual(core.seed_local_low_extras(self.game), [])

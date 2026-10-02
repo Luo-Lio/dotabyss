@@ -4,7 +4,7 @@
 
 结构对标 TSKX 离线版(tools/tskx_launcher.py):直连失败自动回退系统代理、
 后台线程 + 队列刷日志、启动器自替换(``.new`` + cmd)、``--smoke`` 冒烟。
-更新通道:客户端本体(client_body.zip)、bundle 素材增量(caches_update.zip)、
+更新通道:客户端本体(client_body.zip)、bundle 素材增量(caches_update.zip)、主数据缓存(master_data.zip)、
 catalog 种子、剧情索引/封面、插件 DLL、玩家文档、启动器本体;基线不一致时
 拒绝增量更新并要求重装完整包。自测口:``--release-dir``(目录当 HTTP)、
 ``--auto-update``(跑一次更新并落盘结果)。
@@ -230,6 +230,22 @@ def make_dir_fetchers(release_dir):
     return get, download
 
 
+def _has_preview_files(directory):
+    """判断封面目录是否至少有一个文件,用于兼容旧版本元数据缺失。"""
+    if not os.path.isdir(directory):
+        return False
+    try:
+        return any(os.path.isfile(os.path.join(directory, name))
+                   for name in os.listdir(directory))
+    except OSError:
+        return False
+
+
+def _has_player_docs(game_dir):
+    """判断玩家文档白名单是否完整,用于兼容旧版本元数据缺失。"""
+    return all(os.path.isfile(os.path.join(game_dir, name)) for name in c.PLAYER_DOC_NAMES)
+
+
 _DETACHED = 0x00000008
 _NEW_GROUP = 0x00000200
 
@@ -300,6 +316,23 @@ def _plugin_version_hint(game_dir):
     return parts[1].strip() if len(parts) == 2 else ""
 
 
+_PLUGIN_VERSION_DISPLAY_LIMIT = 24
+
+
+def short_plugin_version(text):
+    """把插件版本规范化为适合顶栏显示的短文本。
+
+    参数:text 为完整插件版本,可包含 ``+`` 后的源代码修订号。
+    返回:去掉 source revision、且不超过 24 个字符的显示版本;空输入返回空串。
+    """
+    if text is None:
+        return ""
+    value = str(text).split("+", 1)[0]
+    if len(value) > _PLUGIN_VERSION_DISPLAY_LIMIT:
+        return value[:_PLUGIN_VERSION_DISPLAY_LIMIT - 1] + "…"
+    return value
+
+
 class App:
     """离线启动器主窗口。"""
 
@@ -312,6 +345,9 @@ class App:
         self.root = root
         self.smoke_out = smoke_out
         self.game_dir = game_dir or resolve_game_dir()
+        version = c.load_version(self.game_dir)
+        self._plugin_version_full = (str(version.get("plugin_version") or "")
+                                     or _plugin_version_hint(self.game_dir))
         self.q = queue.Queue()
         set_http_note(self._emit)
         self.busy = False
@@ -340,7 +376,6 @@ class App:
         self._style()
         self._build()
         self._poll_queue()
-        version = c.load_version(self.game_dir)
         if smoke_out:
             root.after(3000, lambda: self._smoke_done(smoke_out))
         elif auto_out:
@@ -363,7 +398,7 @@ class App:
         """右侧版本标签文案:离线包日期与插件版本。"""
         data = c.load_version(self.game_dir)
         pack_ver = str(data.get("version") or "")
-        plugin_ver = str(data.get("plugin_version") or "") or _plugin_version_hint(self.game_dir)
+        plugin_ver = short_plugin_version(self._plugin_version_full)
         if pack_ver and plugin_ver:
             return "离线包 %s\n插件 v%s" % (pack_ver, plugin_ver)
         if pack_ver:
@@ -433,6 +468,8 @@ class App:
             self.btn_repair, self.btn_logs, self.btn_adv,
         ]
         self.log("游戏目录:%s" % self.game_dir, "dim")
+        if self._plugin_version_full:
+            self.log("插件完整版本: %s" % self._plugin_version_full, "dim")
 
     def _toggle_advanced(self):
         """展开或收起自检/探针/修复/打开日志。"""
@@ -640,7 +677,7 @@ class App:
         threading.Thread(target=self._check_update_quiet, daemon=True).start()
 
     def _check_update_quiet(self):
-        """静默检查:有新版 → 按钮「有更新」;基线不一致 → 「需重装」。"""
+        """静默检查版本与轻量产物状态:有待修复项 → 按钮「有更新」。"""
         try:
             _parsed, remote = self._fetch_remote()
         except Exception:
@@ -653,6 +690,10 @@ class App:
         if str(remote.get("version") or "") != str(local.get("version") or ""):
             self._emit("发现新版本 %s(本机 %s),可点「更新」。"
                        % (remote.get("version") or "?", local.get("version") or "?"), "warn")
+            self._set_button_text("有更新")
+            return
+        if not self._quiet_outputs_current(remote, local):
+            self._emit("本地产物未完全就绪,点「更新」补齐。", "warn")
             self._set_button_text("有更新")
 
     def _temp_zip(self, name):
@@ -745,6 +786,58 @@ class App:
                 pass
         return "已补充 %d 个 bundle 素材" % len(logs)
 
+    def _apply_master_data(self, release, remote, stamp):
+        """下载主数据附件、写入包内种子并播种 LocalLow。
+
+        新版 Release 声明主数据清单时附件是强制项;旧 Release 没有该字段则兼容跳过。
+        主数据允许替换同路径旧缓存,其它 LocalLow 文件仍只补缺失。
+        """
+        files = remote.get("master_data_files") or {}
+        declared = bool(files or remote.get("master_data_md5") or remote.get("master_data_url"))
+        if not declared:
+            return ""
+        url = release.get("master_data_url")
+        if not url:
+            raise RuntimeError("Release 缺少主数据附件 master_data.zip")
+        if not isinstance(files, dict) or not files:
+            raise RuntimeError("version.json 缺少主数据文件清单")
+        if any(not c.master_data_rel_allowed(rel) for rel in files):
+            raise RuntimeError("主数据文件清单含非法路径")
+        if not remote.get("master_data_md5"):
+            raise RuntimeError("version.json 缺少 master_data.zip 摘要")
+        if any(not isinstance(digest, str) or len(digest) != 32
+               or any(ch not in "0123456789abcdefABCDEF" for ch in digest)
+               for digest in files.values()):
+            raise RuntimeError("主数据文件清单含非法 MD5")
+
+        seed_root = c.local_low_seed_dir(self.game_dir)
+        stored_zip_md5 = str(c.load_version(self.game_dir).get("master_data_md5") or "")
+        seed_ready = all(
+            os.path.isfile(os.path.join(seed_root, *rel.replace("\\", "/").split("/")))
+            and not c.file_needs_update(
+                os.path.join(seed_root, *rel.replace("\\", "/").split("/")), expected)
+            for rel, expected in files.items()) and stored_zip_md5 == str(
+                remote.get("master_data_md5") or "").lower()
+        if not seed_ready:
+            self._emit("主数据缓存需更新 %d 个文件,开始下载…" % len(files), "dim")
+            zip_path = self._temp_zip("master_data")
+            try:
+                got = _http_download(url, zip_path, timeout=600)
+                expected_zip = str(remote.get("master_data_md5") or "")
+                if expected_zip and c.file_md5(zip_path) != expected_zip.lower():
+                    raise RuntimeError("master_data.zip 摘要不符(下载 %d 字节)" % got)
+                c.install_zip_members(zip_path, seed_root, files, stamp,
+                                      checker=c.master_data_rel_allowed, backup=False)
+            finally:
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
+        lines = c.seed_local_low_extras(self.game_dir)
+        if any("失败" in line for line in lines):
+            raise RuntimeError("主数据播种失败:" + "、".join(lines))
+        return "已更新并播种主数据缓存(%d 个文件)" % len(files)
+
     def _write_auto_result(self, status):
         """自测模式:把状态与最近日志写到 --auto-update 指定文件。"""
         if not self._auto_out:
@@ -781,33 +874,220 @@ class App:
                 self._write_auto_result("FAIL")
         self._close_window()
 
-    def _apply_docs(self, release, remote, stamp):
+    def _apply_docs(self, release, remote, stamp, local=None, same_version=False):
         """从 Release 更新玩家文档包(白名单落地到游戏根)。
 
         参数:release 为 parse_latest_release 产物;remote 为 version.json;
             stamp 为备份后缀。返回:中文说明或空串。
         """
         url = release.get("player_docs_url")
-        if not url:
-            return ""
         expected = str(remote.get("player_docs_zip_md5") or "")
+        stored = str((local or {}).get("player_docs_zip_md5") or "")
+        if expected and stored.lower() == expected.lower():
+            return ""
+        if expected and same_version and not stored and _has_player_docs(self.game_dir):
+            return ""
+        if not url:
+            if expected:
+                raise RuntimeError("Release 缺少 player_docs.zip")
+            return ""
         raw = _http_get(url, timeout=300)
         if expected and hashlib.md5(raw).hexdigest() != expected.lower():
             raise RuntimeError("文档包摘要不符")
         count = c.extract_zip_bytes(raw, self.game_dir, allowed_names=c.PLAYER_DOC_NAMES)
         return "已更新玩家文档(%d 个文件)" % count
 
-    def _apply_previews(self, release, remote):
+    def _apply_previews(self, release, remote, local=None, same_version=False):
         """从 Release 更新封面包(previews.zip 覆盖到预览目录)。"""
         url = release.get("previews_zip_url")
-        if not url:
-            return ""
         expected = str(remote.get("previews_zip_md5") or "")
+        stored = str((local or {}).get("previews_zip_md5") or "")
+        if expected and stored.lower() == expected.lower():
+            return ""
+        if expected and same_version and not stored and _has_preview_files(c.previews_dir(self.game_dir)):
+            return ""
+        if not url:
+            if expected:
+                raise RuntimeError("Release 缺少 previews.zip")
+            return ""
         raw = _http_get(url, timeout=300)
         if expected and hashlib.md5(raw).hexdigest() != expected.lower():
             raise RuntimeError("封面包摘要不符")
         count = c.extract_zip_bytes(raw, c.previews_dir(self.game_dir))
         return "已更新 %d 张封面" % count
+
+    def _release_outputs_current(self, remote, local):
+        """核对 Release 已声明的本地产物,避免同版本过早返回。
+
+        返回:所有可核对的声明均匹配时为 True;旧 Release 未声明的字段不参与判断。
+        主数据同时要求本地版本记录 ZIP 摘要、种子文件存在且逐文件 MD5 一致,
+        这样旧启动器刚完成自替换后仍会进入一次修复流程。
+        """
+        for rel, expected in (
+                (("BepInEx", "plugins", "StoryViewer", "StoryViewer.dll"),
+                 remote.get("plugin_md5")),
+                (("BepInEx", "plugins", "StoryViewer", "stories.json"),
+                 remote.get("stories_md5"))):
+            if expected and c.file_needs_update(os.path.join(self.game_dir, *rel), expected):
+                return False
+
+        previews_md5 = str(remote.get("previews_zip_md5") or "")
+        if previews_md5:
+            stored_previews = str(local.get("previews_zip_md5") or "")
+            if stored_previews:
+                if stored_previews.lower() != previews_md5.lower():
+                    return False
+            elif not _has_preview_files(c.previews_dir(self.game_dir)):
+                return False
+        docs_md5 = str(remote.get("player_docs_zip_md5") or "")
+        if docs_md5:
+            stored_docs = str(local.get("player_docs_zip_md5") or "")
+            if stored_docs:
+                if stored_docs.lower() != docs_md5.lower():
+                    return False
+            elif not _has_player_docs(self.game_dir):
+                return False
+
+        body = remote.get("client_body")
+        if body is not None:
+            if not isinstance(body, dict):
+                return False
+            try:
+                if c.client_body_todo(self.game_dir, body.get("files") or {}):
+                    return False
+            except (TypeError, ValueError, OSError):
+                return False
+
+        caches = remote.get("caches_added")
+        if caches is not None:
+            if not isinstance(caches, dict):
+                return False
+            try:
+                if c.caches_added_todo(self.game_dir, caches.get("files") or {}):
+                    return False
+            except (TypeError, ValueError, OSError):
+                return False
+
+        catalog_hash = str(remote.get("catalog_hash") or "")
+        if catalog_hash and c.catalog_seed_hash(self.game_dir) != catalog_hash:
+            return False
+        catalog_bin_md5 = str(remote.get("catalog_bin_md5") or "")
+        if catalog_bin_md5:
+            catalog_bin = os.path.join(c.catalog_seed_dir(self.game_dir), c.CATALOG_BIN_NAME)
+            if c.file_needs_update(catalog_bin, catalog_bin_md5):
+                return False
+
+        master_declared = any(key in remote for key in
+                              ("master_data_url", "master_data_md5", "master_data_files"))
+        if master_declared:
+            files = remote.get("master_data_files")
+            expected_zip = str(remote.get("master_data_md5") or "")
+            if (not isinstance(files, dict) or not files or len(expected_zip) != 32
+                    or not all(ch in "0123456789abcdefABCDEF" for ch in expected_zip)):
+                return False
+            if str(local.get("master_data_md5") or "").lower() != expected_zip.lower():
+                return False
+            seed_root = c.local_low_seed_dir(self.game_dir)
+            for rel, expected in files.items():
+                if (not isinstance(expected, str) or len(expected) != 32
+                        or any(ch not in "0123456789abcdefABCDEF" for ch in expected)
+                        or not c.master_data_rel_allowed(rel)):
+                    return False
+                seed_file = os.path.join(seed_root, *rel.replace("\\", "/").split("/"))
+                if c.file_needs_update(seed_file, expected):
+                    return False
+
+        launcher_md5 = str(remote.get("launcher_md5") or "")
+        if launcher_md5:
+            if getattr(sys, "frozen", False):
+                if c.file_needs_update(c.launcher_path(self.game_dir), launcher_md5):
+                    return False
+            elif str(local.get("launcher_md5") or "").lower() != launcher_md5.lower():
+                return False
+        return True
+
+    def _quiet_outputs_current(self, remote, local):
+        """用轻量规则判断静默检查是否可以保持现状。
+
+        这里不能调用 ``_release_outputs_current``:后者会扫描客户端本体和
+        Caches 的全部文件。静默检查只比较 ``offline_version.json`` 已记录的
+        产物摘要,并逐个校验主数据种子(通常只有一个约 11 MB 的 ``.dat``)。
+        远端未声明的字段按旧 Release 兼容规则跳过。
+        返回:所有已声明记录和主数据种子均匹配时为 True。
+        """
+        record_fields = (
+            "plugin_md5", "stories_md5", "previews_zip_md5",
+            "player_docs_zip_md5", "catalog_hash", "catalog_bin_md5",
+            "launcher_md5",
+        )
+        for field in record_fields:
+            expected = remote.get(field)
+            if expected and str(local.get(field) or "").lower() != str(expected).lower():
+                return False
+
+        for remote_field, local_fields in (
+                ("client_body", ("client_body_zip_md5", "client_body_md5")),
+                ("caches_added", ("caches_added_zip_md5", "caches_added_md5"))):
+            if remote_field not in remote or remote.get(remote_field) is None:
+                continue
+            manifest = remote.get(remote_field)
+            if not isinstance(manifest, dict):
+                return False
+            expected = manifest.get("zip_md5")
+            if expected:
+                stored = next((local.get(field) for field in local_fields
+                               if local.get(field)), "")
+                if str(stored).lower() != str(expected).lower():
+                    return False
+
+        master_declared = any(key in remote for key in
+                              ("master_data_url", "master_data_md5", "master_data_files"))
+        if not master_declared:
+            return True
+        files = remote.get("master_data_files")
+        expected_zip = str(remote.get("master_data_md5") or "")
+        if (not isinstance(files, dict) or not files or len(expected_zip) != 32
+                or any(ch not in "0123456789abcdefABCDEF" for ch in expected_zip)
+                or str(local.get("master_data_md5") or "").lower() != expected_zip.lower()):
+            return False
+        seed_root = c.local_low_seed_dir(self.game_dir)
+        for rel, expected in files.items():
+            if (not isinstance(rel, str) or not isinstance(expected, str)
+                    or len(expected) != 32
+                    or any(ch not in "0123456789abcdefABCDEF" for ch in expected)
+                    or not c.master_data_rel_allowed(rel)):
+                return False
+            seed_file = os.path.join(seed_root, *rel.replace("\\", "/").split("/"))
+            try:
+                if c.file_needs_update(seed_file, expected):
+                    return False
+            except OSError:
+                return False
+        return True
+
+    def _backfill_remote_records(self, local, remote):
+        """在同版本早退前补写远端产物摘要,避免旧元数据反复触发静默提示。
+
+        调用前已经通过 ``_release_outputs_current`` 的实际文件校验,这里只记录
+        已确认的摘要,不下载或重新扫描大体积附件。返回是否写入了新记录。
+        """
+        updated = dict(local)
+        for field in (
+                "plugin_md5", "stories_md5", "previews_zip_md5",
+                "player_docs_zip_md5", "launcher_md5", "catalog_hash",
+                "catalog_bin_md5", "master_data_md5"):
+            if field in remote:
+                updated[field] = remote[field]
+        for remote_field, local_field in (
+                ("client_body", "client_body_zip_md5"),
+                ("caches_added", "caches_added_zip_md5")):
+            manifest = remote.get(remote_field)
+            if isinstance(manifest, dict) and "zip_md5" in manifest:
+                updated[local_field] = manifest["zip_md5"]
+        if updated == local:
+            return False
+        c.save_version(self.game_dir, updated)
+        return True
 
     def _do_update(self):
         """执行一次 latest 累积更新;任一步异常只打红字。
@@ -831,18 +1111,23 @@ class App:
                            % (local.get("baseline") or "无", remote.get("baseline") or "无"), "err")
                 self._set_button_text("需重装")
                 return
-            if str(remote.get("version") or "") == str(local.get("version") or ""):
+            same_version = str(remote.get("version") or "") == str(local.get("version") or "")
+            if same_version and self._release_outputs_current(remote, local):
+                self._backfill_remote_records(local, remote)
                 self._emit("已是最新。", "ok")
                 return
+            if same_version:
+                self._emit("版本号相同但本地产物未完全就绪,继续校验修复。", "warn")
             stamp = time.strftime("%Y%m%d_%H%M%S")
             for line in c.safe_repair(self.game_dir):
                 self._emit(line, "ok")
 
-            # 本体 → 素材 → catalog → 索引 → 封面 → 插件 DLL → 文档 → 启动器
+            # 本体 → 素材 → 主数据 → catalog → 索引 → 封面 → 插件 DLL → 文档 → 启动器
             # (本体先行:它决定其余文件的格式;先数据后代码,任一失败旧版仍可玩)
             for message in (
                 self._apply_client_body(parsed, remote, stamp),
                 self._apply_caches_added(parsed, remote, stamp),
+                self._apply_master_data(parsed, remote, stamp),
                 self._apply_catalog(parsed, remote),
             ):
                 if message:
@@ -854,7 +1139,7 @@ class App:
                 raw = _http_get(parsed["stories_url"], timeout=300)
                 self._emit(c.install_bytes(stories_dest, raw, stories_md5, stamp), "ok")
 
-            previews_msg = self._apply_previews(parsed, remote)
+            previews_msg = self._apply_previews(parsed, remote, local, same_version)
             if previews_msg:
                 self._emit(previews_msg, "ok")
 
@@ -864,7 +1149,7 @@ class App:
                 raw = _http_get(parsed["plugin_dll_url"], timeout=300)
                 self._emit(c.install_bytes(dll_dest, raw, dll_md5, stamp), "ok")
 
-            docs_msg = self._apply_docs(parsed, remote, stamp)
+            docs_msg = self._apply_docs(parsed, remote, stamp, local, same_version)
             if docs_msg:
                 self._emit(docs_msg, "ok")
 
@@ -889,8 +1174,22 @@ class App:
                 "plugin_version": remote.get("plugin_version", local.get("plugin_version")),
                 "plugin_md5": remote.get("plugin_md5", local.get("plugin_md5")),
                 "stories_md5": remote.get("stories_md5", local.get("stories_md5")),
+                "previews_zip_md5": remote.get("previews_zip_md5", local.get("previews_zip_md5")),
+                "player_docs_zip_md5": remote.get("player_docs_zip_md5",
+                                                    local.get("player_docs_zip_md5")),
                 "launcher_md5": remote.get("launcher_md5", local.get("launcher_md5")),
                 "catalog_hash": remote.get("catalog_hash", local.get("catalog_hash")),
+                "catalog_bin_md5": remote.get("catalog_bin_md5", local.get("catalog_bin_md5")),
+                "master_data_md5": remote.get("master_data_md5", local.get("master_data_md5")),
+                "client_body_zip_md5": (
+                    (remote.get("client_body") or {}).get("zip_md5", local.get("client_body_zip_md5"))
+                    if isinstance(remote.get("client_body"), dict)
+                    else local.get("client_body_zip_md5")),
+                "caches_added_zip_md5": (
+                    (remote.get("caches_added") or {}).get("zip_md5",
+                                                            local.get("caches_added_zip_md5"))
+                    if isinstance(remote.get("caches_added"), dict)
+                    else local.get("caches_added_zip_md5")),
                 "first_ready": True,
             })
             c.save_version(self.game_dir, new_version)

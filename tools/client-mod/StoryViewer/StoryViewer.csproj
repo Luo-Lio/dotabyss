@@ -16,9 +16,10 @@
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <DebugType>none</DebugType>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <Version>0.7.17</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <DebugType>none</DebugType>
+    <Version>0.7.18</Version>
     <Product>StoryViewer</Product>
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
     <!-- 复制出来的客户端目录(含 BepInEx\core、BepInEx\interop、BepInEx\unity-libs) -->

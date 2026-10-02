@@ -2,6 +2,7 @@ using System;
 using HarmonyLib;
 using Il2CppRegex = Il2CppSystem.Text.RegularExpressions.Regex;
 using Il2CppRegexOptions = Il2CppSystem.Text.RegularExpressions.RegexOptions;
+using Il2CppTimeSpan = Il2CppSystem.TimeSpan;
 
 namespace StoryViewer.Patches;
 
@@ -44,7 +45,7 @@ internal static class OfflineNovelUserNamePatch
 /// </summary>
 [HarmonyPatch(typeof(Il2CppRegex), nameof(Il2CppRegex.Replace), new[]
 {
-    typeof(string), typeof(string), typeof(string), typeof(Il2CppRegexOptions), typeof(TimeSpan),
+    typeof(string), typeof(string), typeof(string), typeof(Il2CppRegexOptions), typeof(Il2CppTimeSpan),
 })]
 internal static class OfflineNovelUserNameTimeoutPatch
 {
