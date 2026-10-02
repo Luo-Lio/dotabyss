@@ -34,7 +34,8 @@ pwsh -File tools\launcher\freeze_launcher.ps1
   包内 `catalog_seed\`(新机器首启的关键)、`baseline` 基线门禁(基线不符必须重装完整包)、
   更新通道覆盖客户端本体与素材增量。
 - 开发者文档:[`docs/离线版实现说明_开发者必读.md`](docs/离线版实现说明_开发者必读.md)、
-  [`docs/GitHub更新流程.md`](docs/GitHub更新流程.md)。
+  [`docs/GitHub更新流程.md`](docs/GitHub更新流程.md)、
+  [`docs/日常更新流程.md`](docs/日常更新流程.md)(游戏更新后"同步→打包→发布"的逐步操作手册)。
 
 ## 用法
 
