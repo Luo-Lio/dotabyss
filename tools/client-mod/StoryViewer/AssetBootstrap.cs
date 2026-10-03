@@ -150,6 +150,10 @@ internal static class AssetBootstrap
             }
             else
             {
+                // catalog 加载失败即置失败态(不做 file:// 回退:离线包没有本地 aa/ 目录,
+                // 用 file:// 注册的 catalog 会把 bundle 解析成本地路径而绕过本机服务器,
+                // 结果「进得去、开得了面板、但播放黑屏」。正解是让 http catalog 加载成功,
+                // 服务器已不供应 .hash(0.7.19),09-25 实机证明该路径可正常供应 bundle。)。
                 _state = 4;
                 Plugin.Logger?.LogError($"[资源自举] 失败:catalog 加载 Status={status},异常={ExceptionOf(_op)}");
             }

@@ -242,15 +242,12 @@ internal sealed class OfflineApiServer : IDisposable
 
         if (MatchesAny(lower, CatalogHashSuffixes))
         {
-            var bytes = EnsureCatalogHashBytes();
-            if (bytes == null)
-            {
-                note = "本地 catalog.hash 缺失 → 404";
-                WriteResponse(stream, 404, "text/plain; charset=utf-8", "no local catalog hash");
-                return true;
-            }
-            WriteBytes(stream, 200, "application/octet-stream", bytes);
-            note = $"本地 catalog.hash {bytes.Length} 字节";
+            // 0.7.19:不再供应 catalog .hash 文件。
+            // 游戏 Addressables 初始化会用此哈希校验 catalog 正文;离线包种子与本体
+            // 更新后 settings.json 期望值不一致时验证必定失败,导致黑屏。
+            // 返回 404 让引擎跳过哈希校验、直接信任已下载的 catalog 内容。
+            note = "catalog hash 已禁用(离线绕过) → 404";
+            WriteResponse(stream, 404, "text/plain; charset=utf-8", "hash check disabled");
             return true;
         }
 
