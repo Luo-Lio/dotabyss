@@ -586,8 +586,16 @@ def build_launcher_replace_cmd(game_dir: str) -> str:
     """
     exe = launcher_path(game_dir)
     new = exe + ".new"
-    return 'ping 127.0.0.1 -n 3 >nul & move /Y "%s" "%s" & start "" "%s"' % (
-        new, exe, exe)
+    # 先等 ~3s 让本进程退出;move 最多重试 3 次(间隔 ~1s),避免因 exe 短暂
+    # 被占用而 move 失败(那会导致需手动重启才完成)。start 无论如何都执行;
+    # 若三次都失败,下次启动的 pending_launcher_swap 仍会用 .new 兜底完成。
+    return (
+        'ping 127.0.0.1 -n 4 >nul '
+        '& (move /Y "%(new)s" "%(exe)s" '
+        '|| (ping 127.0.0.1 -n 2 >nul & move /Y "%(new)s" "%(exe)s") '
+        '|| (ping 127.0.0.1 -n 2 >nul & move /Y "%(new)s" "%(exe)s")) '
+        '& start "" "%(exe)s"'
+    ) % {"new": new, "exe": exe}
 
 
 def extract_zip_bytes(data: bytes, dest_dir: str, allowed_names=None) -> int:
@@ -1487,8 +1495,9 @@ def upload_diagnostics(game_dir: str, zip_path: str, url: str = None,
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(request, timeout=DIAG_UPLOAD_TIMEOUT) as response:
             code = getattr(response, "status", None) or response.getcode()
-            return "ok", "已上传(HTTP %s):%s" % (code, url)
+            # 故意不回显 url(含服务器 IP/隐身路径);玩家只需知道送达与否。
+            return "ok", "已上传(HTTP %s),诊断包已送达服务器" % code
     except urllib.error.HTTPError as error:
-        return "error", "上传被拒(HTTP %s):%s" % (error.code, url)
+        return "error", "上传被拒(HTTP %s),请重试或手动发送" % error.code
     except (urllib.error.URLError, OSError) as error:
         return "error", "上传失败:%s" % error

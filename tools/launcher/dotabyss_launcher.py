@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import tkinter as tk
@@ -1279,9 +1280,27 @@ def main(argv=None):
         return 0
     root = tk.Tk()
     app = App(root, smoke_out=smoke_out, game_dir=game_dir, auto_out=auto_out)
+
+    def _log_exc(etype, value, tb):
+        # --noconsole 下崩溃看不到;落盘到启动器旁供排障(只含 traceback,无密钥)。
+        try:
+            text = "".join(traceback.format_exception(etype, value, tb))
+        except Exception:  # noqa: BLE001 - 格式化失败也不能让日志本身抛错
+            text = repr(value)
+        try:
+            with open(os.path.join(game_dir, "launcher-error.log"), "a", encoding="utf-8") as fh:
+                fh.write("\n=== %s ===\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+        except OSError:
+            pass
+
+    root.report_callback_exception = _log_exc
     if auto_out:
         root.after(600, lambda: app._run_bg(app._auto_update))
-    root.mainloop()
+    try:
+        root.mainloop()
+    except Exception:  # noqa: BLE001 - 主循环外抛的异常也留痕后继续原行为
+        _log_exc(*sys.exc_info())
+        raise
     return 0
 
 
