@@ -16,6 +16,14 @@ namespace StoryViewer;
 /// </summary>
 internal static class NovelPlayer
 {
+    // ---- 场景切换看门狗(0.7.21) ----
+    // ChangeSceneAsync 用 Forget 发后即忘,如果 Addressables 挂了会静默死。
+    // 发起后记录 novelId + deadline;ViewerBehaviour.Update 每秒检查,超时且未进场景则 LogError。
+    internal static string WatchdogNovelId { get; private set; }
+    internal static float WatchdogDeadline { get; private set; }
+    internal static bool WatchdogPending => WatchdogNovelId != null;
+    internal static void ClearWatchdog() { WatchdogNovelId = null; }
+
     /// <summary>
     /// 播放指定剧情。
     /// </summary>
@@ -43,6 +51,10 @@ internal static class NovelPlayer
             var task = NovelSceneTransitionUtility.ChangeSceneAsync(
                 param, Absf.SceneLoadMode.NewScenePushHistory, ct);
             UniTaskExtensions.Forget(task);
+
+            // 看门狗:记录发起时间,15s 后若未进入场景则 Update 里报警。
+            WatchdogNovelId = novelId;
+            WatchdogDeadline = UnityEngine.Time.realtimeSinceStartup + 15f;
 
             Plugin.Logger.LogInfo($"发起剧情播放: {novelId} (skipR18={skipR18})");
             return null;

@@ -367,6 +367,15 @@ public class ViewerBehaviour : MonoBehaviour
             _status = "资源系统就绪,可以播放";
         }
 
+        // 场景切换看门狗(0.7.21): ChangeSceneAsync 15s 后若仍不在剧情场景则写日志。
+        if (NovelPlayer.WatchdogPending && Time.realtimeSinceStartup >= NovelPlayer.WatchdogDeadline)
+        {
+            string pending = NovelPlayer.WatchdogNovelId;
+            NovelPlayer.ClearWatchdog();
+            if (FindLiveTopScene() == null)
+                Plugin.Logger.LogError($"[场景看门狗] {pending} 发起切换后 15s 未进入剧情场景,疑似 Addressables/场景加载卡住");
+        }
+
         // 离线模式:定期输出资产管线快照(定位资源加载卡点;DiagAssets 关闭时为空操作)
         if (Plugin.OfflineApi.Value && Time.unscaledTime >= _nextAssetDiag)
         {
