@@ -171,8 +171,25 @@ internal static class AssetBootstrap
     /// <summary>读装箱 handle 的 Status(反射)。</summary>
     private static string StatusOf(object handle) => ReadMember(handle, "Status")?.ToString() ?? "(未知)";
 
-    /// <summary>读装箱 handle 的 OperationException(反射,失败时给原因)。</summary>
-    private static string ExceptionOf(object handle) => ReadMember(handle, "OperationException")?.ToString() ?? "(无)";
+    /// <summary>读装箱 handle 的 OperationException(反射,失败时给原因;尝试提取 il2cpp 异常的 Message)。</summary>
+    private static string ExceptionOf(object handle)
+    {
+        var exc = ReadMember(handle, "OperationException");
+        if (exc == null) return "(无)";
+        // il2cpp interop 异常对象有 Message 属性;尝试读取以获取有用信息
+        try
+        {
+            var msgProp = exc.GetType().GetProperty("Message");
+            if (msgProp != null)
+            {
+                string msg = msgProp.GetValue(exc)?.ToString();
+                if (!string.IsNullOrEmpty(msg))
+                    return $"{exc.GetType().Name}: {msg}";
+            }
+        }
+        catch { /* 读不到就回退 */ }
+        return exc.ToString();
+    }
 
     /// <summary>按属性/字段名读取装箱对象成员(读不到返回 null)。</summary>
     private static object ReadMember(object target, string name)
