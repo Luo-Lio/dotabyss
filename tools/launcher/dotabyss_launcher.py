@@ -458,14 +458,17 @@ class App:
             self.adv_frame, "修复", self.run_repair, C_BTN, C_BTN_HOVER)
         self.btn_logs = _tk_button(
             self.adv_frame, "打开日志", self.open_logs, C_BTN, C_BTN_HOVER)
+        self.btn_diag = _tk_button(
+            self.adv_frame, "收集日志", self.run_diag, C_BTN, C_BTN_HOVER)
         self.btn_check.pack(side="left")
         self.btn_probe.pack(side="left", padx=8)
         self.btn_repair.pack(side="left")
         self.btn_logs.pack(side="left", padx=8)
+        self.btn_diag.pack(side="left")
         self._advanced_open = False
         self._btns = [
             self.btn_start, self.btn_update, self.btn_check, self.btn_probe,
-            self.btn_repair, self.btn_logs, self.btn_adv,
+            self.btn_repair, self.btn_logs, self.btn_diag, self.btn_adv,
         ]
         self.log("游戏目录:%s" % self.game_dir, "dim")
         if self._plugin_version_full:
@@ -651,6 +654,35 @@ class App:
             self.log("已打开日志目录。", "dim")
         except OSError as exc:
             self.log("打开失败:%s" % exc, "err")
+
+    def run_diag(self):
+        """收集日志诊断包(插件日志 + 静态环境),并尝试上传(未配置目标则只本地保存)。"""
+        def work():
+            self._emit("开始收集诊断包…", "dim")
+            try:
+                zip_path, lines = c.collect_diagnostics(self.game_dir)
+            except Exception as exc:  # noqa: BLE001 - 诊断失败不影响启动器
+                self._emit("收集失败:%s" % exc, "err")
+                return
+            self._emit("诊断包已生成:%s" % zip_path, "ok")
+            for line in lines:
+                if (line.startswith("插件 DLL") or line.startswith("配置离线档")
+                        or "Caches 顶层目录数" in line or "资源命中统计" in line):
+                    self._emit("  " + line, "dim")
+            status, detail = c.upload_diagnostics(self.game_dir, zip_path)
+            tag = {"ok": "ok", "skipped": "warn", "error": "err"}.get(status, "dim")
+            label = {"ok": "成功", "skipped": "跳过", "error": "失败"}.get(status, status)
+            self._emit("上传%s:%s" % (label, detail), tag)
+            # 未配置/上传失败时,自动打开诊断目录并提示手动发送,保证零基础设施也能回传。
+            if status in ("skipped", "error"):
+                folder = os.path.dirname(zip_path)
+                self._emit("请把 %s 发给维护者(已为你打开所在目录)。"
+                           % os.path.basename(zip_path), "warn")
+                try:
+                    os.startfile(folder)  # noqa: S606 - 固定打开本地目录
+                except OSError as exc:
+                    self._emit("打开目录失败:%s(路径:%s)" % (exc, folder), "err")
+        self._run_bg(work)
 
     def run_update(self):
         """用户点击后才访问 GitHub;失败不挡住开始游戏。"""

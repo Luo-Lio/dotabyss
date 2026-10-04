@@ -1,0 +1,4 @@
+# 统一换行:文本按平台自动,但发往 Linux 的 shell 脚本恒用 LF(避免 CRLF 破坏 bash)
+* text=auto
+*.sh text eol=lf
+*.js text eol=lf

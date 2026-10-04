@@ -1034,5 +1034,75 @@ class HealthIdentityCatalogTest(unittest.TestCase):
         self.assertIn("修复", item.detail)
 
 
+class CollectDiagnosticsTest(unittest.TestCase):
+    """collect_diagnostics / upload_diagnostics:打包关键文件、命中统计、上传未配则跳过。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.game = self.tmp.name
+        bex = os.path.join(self.game, "BepInEx")
+        cfg_dir = os.path.join(bex, "config")
+        plugin = os.path.join(bex, "plugins", "StoryViewer")
+        data = os.path.join(self.game, core.DATA_DIR_NAME)
+        for d in (bex, cfg_dir, plugin, data):
+            os.makedirs(d)
+        with open(os.path.join(bex, "LogOutput.log"), "w", encoding="utf-8") as handle:
+            handle.write("[资源自举] 完成:内容 catalog 已注册\n")
+        with open(os.path.join(bex, "ErrorLog.log"), "w", encoding="utf-8") as handle:
+            handle.write("\n")
+        with open(os.path.join(bex, "offline-api.log"), "w", encoding="utf-8") as handle:
+            handle.write("GET ... 本地缓存 bundle(累计命中 36 / 缺失 0)\n")
+        with open(os.path.join(cfg_dir, "dotabyss.storyviewer.cfg"), "w", encoding="utf-8") as handle:
+            handle.write("[Offline]\nOfflineAuth = true\nOfflineApi = true\n"
+                         "RedirectAssetServer = true\nServeCachedBundles = true\n"
+                         "SkipRequestEncryption = true\nForceDmmSdkSuccess = true\n"
+                         "CaptureForward = false\nDiagAssets = false\n")
+        with open(os.path.join(plugin, core.VERSION_NAME), "w", encoding="utf-8") as handle:
+            json.dump({"version": "20261003", "baseline": "20260924",
+                       "channel": "baseline", "plugin_version": "0.7.19"}, handle)
+        with open(os.path.join(plugin, "StoryViewer.dll"), "wb") as handle:
+            handle.write(b"MZfake")
+        with open(os.path.join(data, core.APP_INFO_NAME), "w", encoding="utf-8") as handle:
+            handle.write("EXNOA LLC.\nドットアビスX_offline\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_collect_zips_key_files_and_summary(self):
+        with mock.patch.object(core, "game_running", lambda: False), \
+             mock.patch.object(core, "plugin_file_version", lambda gd: "0.7.19"):
+            zip_path, lines = core.collect_diagnostics(
+                self.game, dest_dir=os.path.join(self.game, "out"))
+        self.assertTrue(os.path.isfile(zip_path))
+        with zipfile.ZipFile(zip_path) as archive:
+            names = set(archive.namelist())
+        for want in ("diag/diag_summary.txt", "diag/logs/LogOutput.log",
+                     "diag/logs/offline-api.log", "diag/config/dotabyss.storyviewer.cfg",
+                     "diag/offline_version.json"):
+            self.assertIn(want, names)
+        text = "\n".join(lines)
+        self.assertIn("累计命中 36", text)
+        self.assertIn("0.7.19", text)
+        self.assertIn("baseline=20260924", text)
+
+    def test_upload_skipped_without_target(self):
+        os.environ.pop(core.DIAG_UPLOAD_URL_ENV, None)
+        status, _detail = core.upload_diagnostics(self.game, "x.zip", url="", token="")
+        self.assertEqual(status, "skipped")
+
+    def test_upload_ok_with_mocked_urlopen(self):
+        zip_path = os.path.join(self.game, "d.zip")
+        with open(zip_path, "wb") as handle:
+            handle.write(b"PKfake")
+        fake_resp = mock.MagicMock()
+        fake_resp.status = 200
+        fake_resp.__enter__.return_value = fake_resp
+        with mock.patch("urllib.request.urlopen", return_value=fake_resp) as urlopen:
+            status, _detail = core.upload_diagnostics(
+                self.game, zip_path, url="http://up", token="t")
+        self.assertEqual(status, "ok")
+        self.assertTrue(urlopen.called)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

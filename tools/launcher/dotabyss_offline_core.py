@@ -1116,3 +1116,366 @@ def read_github_repo(game_dir: str) -> str:
         return str((data or {}).get("github_repo") or "").strip()
     except (OSError, json.JSONDecodeError):
         return ""
+
+
+# ---------------------------------------------------------------- 诊断包收集与上传
+#
+# 分工(见"诊断功能双端分工架构"):启动器负责静态环境与日志文件打包;
+# 运行时的 [资源自举]/[未观察异常]/场景切换 已写进 LogOutput.log、命中/缺失写进
+# offline-api.log,这里把这些文件收进来即可覆盖玩家侧黑屏排查所需。
+# 关键约束:纯本地文件操作,绝不发网络请求(上传是显式、配置驱动的第二步);
+# 任何单个文件缺失或读失败都跳过,不因个别问题让整个诊断包生成失败。
+
+DIAG_DIR_NAME = "diagnostics"
+DIAG_MAX_FILE_BYTES = 8 * 1024 * 1024          # 单个日志最多收录 8MB(超出取尾部)
+DIAG_CACHE_SCAN_LIMIT = 40000                  # Caches 遍历上限,防止超大目录卡住
+DIAG_UPLOAD_URL_ENV = "DOTABYSS_DIAG_UPLOAD_URL"
+DIAG_UPLOAD_TOKEN_ENV = "DOTABYSS_DIAG_UPLOAD_TOKEN"
+DIAG_UPLOAD_TIMEOUT = 30
+DIAG_KEEP_HEAD_BYTES = 2 * 1024 * 1024          # 超大日志额外保留开头的字节数(崩溃签名常在开机段)
+DIAG_SIGNATURE_SCAN_BYTES = 16 * 1024 * 1024    # 关键字抽取最多扫描的字节数(有界,防超大日志卡住)
+# 已知黑屏崩溃链签名:原生 Addressables 初始化失败 → aa/runtime.json 回退 → CriSound/BitConverter。
+DIAG_SIGNATURE_PATTERNS = (
+    "runtime.json", "TextDataProvider", "Player Content", "Unable to load runtime",
+    "asset is null", "BitConverter", "Value cannot be null", "CriSound",
+    "LoadBuiltinSound", "InitializeAsync", "InitializeServicesAsync",
+)
+
+
+def _tail_bytes(path: str, max_bytes: int = DIAG_MAX_FILE_BYTES) -> bytes:
+    """读取文件尾部至多 ``max_bytes`` 字节(小文件全读);失败返回空字节。"""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            return handle.read()
+    except OSError:
+        return b""
+
+
+def _cap_bytes_head_tail(path: str, max_bytes: int = DIAG_MAX_FILE_BYTES,
+                         head_bytes: int = DIAG_KEEP_HEAD_BYTES) -> bytes:
+    """读取日志:小文件全收;超大文件保留开头 ``head_bytes`` + 结尾剩余配额,
+    中间用截断标记替代。确保开机段的崩溃签名与最近的活动都能进诊断包。"""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return b""
+    if size <= max_bytes:
+        return _tail_bytes(path, max_bytes)
+    tail_quota = max_bytes - head_bytes
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(head_bytes)
+            handle.seek(size - tail_quota)
+            tail = handle.read(tail_quota)
+    except OSError:
+        return b""
+    marker = ("\n\n=== [...中间 %d 字节已省略...] ===\n\n"
+              % (size - head_bytes - tail_quota)).encode("utf-8")
+    return head + marker + tail
+
+
+def _diag_signature_lines(game_dir: str) -> list:
+    """从主日志开机段抽取已知崩溃签名行,即便原始日志超限被截断,摘要里也留痕。"""
+    path = os.path.join(logs_dir(game_dir), "LogOutput.log")
+    if not os.path.isfile(path):
+        return []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            raw = handle.read(min(size, DIAG_SIGNATURE_SCAN_BYTES))
+    except OSError:
+        return []
+    text = raw.decode("utf-8", errors="replace")
+    out = []
+    seen = set()
+    for line in text.splitlines():
+        low = line.lower()
+        if any(pat.lower() in low for pat in DIAG_SIGNATURE_PATTERNS):
+            stripped = line.strip()
+            if stripped and stripped not in seen:
+                seen.add(stripped)
+                out.append(stripped[:300])
+            if len(out) >= 120:
+                break
+    return out
+
+
+def _diag_log_files(bex: str) -> list:
+    """列出 BepInEx 目录里的运行日志文件名(LogOutput*/ErrorLog*/offline-api*,含归档)。"""
+    out = []
+    if not os.path.isdir(bex):
+        return out
+    for name in os.listdir(bex):
+        low = name.lower()
+        if low.endswith(".log") and (low.startswith("logoutput")
+                                      or low.startswith("errorlog")
+                                      or low.startswith("offline-api")):
+            if os.path.isfile(os.path.join(bex, name)):
+                out.append(name)
+    return sorted(out)
+
+
+def _cache_total_bytes(game_dir: str) -> int:
+    """Caches 目录总字节(有界遍历,最多统计 ``DIAG_CACHE_SCAN_LIMIT`` 个文件)。"""
+    root = cache_dir(game_dir)
+    if not os.path.isdir(root):
+        return 0
+    total = 0
+    scanned = 0
+    for base, _dirs, files in os.walk(root):
+        for name in files:
+            scanned += 1
+            try:
+                total += os.path.getsize(os.path.join(base, name))
+            except OSError:
+                pass
+            if scanned >= DIAG_CACHE_SCAN_LIMIT:
+                return total
+    return total
+
+
+def _offline_api_summary(game_dir: str) -> str:
+    """从 offline-api.log 取最近一条 "累计命中/缺失" 统计,一眼看资源命中情况。"""
+    path = os.path.join(logs_dir(game_dir), "offline-api.log")
+    if not os.path.isfile(path):
+        return "无 offline-api.log"
+    last = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "累计命中" in line:
+                    last = line.strip()
+    except OSError as error:
+        return "读取失败:%s" % error
+    return last or "(日志里暂无命中统计)"
+
+
+def _diag_summary_lines(game_dir: str) -> list:
+    """生成诊断摘要文本行(静态环境 + 关键运行时指标 + 自检/探针结果)。"""
+    import platform
+    lines = []
+    lines.append("=== ドットアビスX 离线诊断包 ===")
+    lines.append("生成时间:%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("系统:%s %s / Python %s" % (
+        platform.system(), platform.release(), platform.python_version()))
+    lines.append("游戏目录:%s" % game_dir)
+    try:
+        lines.append("游戏进程:%s" % ("运行中" if game_running() else "未运行"))
+    except Exception as error:  # noqa: BLE001
+        lines.append("游戏进程:探测失败 %s" % error)
+
+    dll = plugin_dll_path(game_dir)
+    try:
+        dll_md5 = file_md5(dll) if os.path.isfile(dll) else "(缺)"
+    except OSError:
+        dll_md5 = "(读失败)"
+    lines.append("插件 DLL:%s md5=%s 版本=%s" % (
+        os.path.basename(dll), dll_md5, plugin_file_version(game_dir) or "(未知)"))
+
+    vpath = version_path(game_dir)
+    if os.path.isfile(vpath):
+        try:
+            with open(vpath, "r", encoding="utf-8") as handle:
+                ver = json.load(handle) or {}
+            lines.append("离线包:version=%s baseline=%s channel=%s plugin=%s" % (
+                ver.get("version"), ver.get("baseline"), ver.get("channel"),
+                ver.get("plugin_version")))
+        except (OSError, json.JSONDecodeError) as error:
+            lines.append("离线包版本文件无法解析:%s" % error)
+    else:
+        lines.append("离线包版本文件:无(%s)" % vpath)
+
+    aip = app_info_path(game_dir)
+    if os.path.isfile(aip):
+        try:
+            with open(aip, "r", encoding="utf-8", errors="replace") as handle:
+                lines.append("app.info:%s" % " / ".join(x.strip() for x in handle if x.strip()))
+        except OSError:
+            pass
+
+    ok, detail = offline_config_status(game_dir)
+    cfg_lines = _read_cfg_lines(config_path(game_dir))
+    extra = {key: _cfg_value(cfg_lines, key)
+             for key in ("DiagAssets", "CaptureForward", "ApiPort")}
+    lines.append("配置离线档:%s 详情:%s 关键额外项:%s" % (
+        "通过" if ok else "不通过", detail, extra))
+
+    lines.append("Caches 顶层目录数=%d(完整阈值 %d)" % (
+        cache_entry_count(game_dir), CACHE_MIN_ENTRIES))
+    lines.append("Caches 总字节≈%d" % _cache_total_bytes(game_dir))
+    lines.append("资源命中统计:%s" % _offline_api_summary(game_dir))
+
+    lines.append("")
+    lines.append("--- health_check ---")
+    try:
+        for item in health_check(game_dir):
+            lines.append("%s [%s] %s" % ("OK " if item.ok else "BAD", item.name, item.detail))
+    except Exception as error:  # noqa: BLE001
+        lines.append("health_check 异常:%s" % error)
+
+    lines.append("")
+    lines.append("--- index_probe ---")
+    try:
+        for item in index_probe(game_dir):
+            lines.append("%s [%s] %s" % ("OK " if item.ok else "BAD", item.name, item.detail))
+    except Exception as error:  # noqa: BLE001
+        lines.append("index_probe 异常:%s" % error)
+
+    lines.append("")
+    lines.append("--- 崩溃签名抽取(LogOutput 开机段关键字) ---")
+    sig = _diag_signature_lines(game_dir)
+    if sig:
+        lines.extend(sig)
+    else:
+        lines.append("(未匹配到已知崩溃签名关键字;可能本次未触发或日志已轮转)")
+
+    return lines
+
+
+def collect_diagnostics(game_dir: str, dest_dir: str = None) -> tuple:
+    """收集日志 + 静态环境,打包成 zip 诊断包。返回 ``(zip 路径, 摘要行列表)``。
+
+    参数:game_dir 游戏根;dest_dir 输出目录(默认游戏根下 ``diagnostics\\``)。
+    说明:纯本地文件操作,不发网络;单个文件超大只收尾部;任何缺失都跳过不报错。
+    """
+    lines = _diag_summary_lines(game_dir)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if not dest_dir:
+        dest_dir = os.path.join(game_dir, DIAG_DIR_NAME)
+    os.makedirs(dest_dir, exist_ok=True)
+    zip_path = os.path.join(dest_dir, "dotabyss-diag-%s.zip" % stamp)
+
+    bex = logs_dir(game_dir)
+    plugin = plugin_dir(game_dir)
+    cfg_dir = os.path.join(bex, "config")
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("diag/diag_summary.txt", ("\n".join(lines) + "\n").encode("utf-8"))
+        for name in _diag_log_files(bex):
+            zf.writestr("diag/logs/" + name, _cap_bytes_head_tail(os.path.join(bex, name)))
+        if os.path.isdir(cfg_dir):
+            for name in os.listdir(cfg_dir):
+                if name.lower().endswith(".cfg") and os.path.isfile(os.path.join(cfg_dir, name)):
+                    zf.writestr("diag/config/" + name, _tail_bytes(os.path.join(cfg_dir, name)))
+        for arc, real in (("diag/offline_version.json", version_path(game_dir)),
+                          ("diag/app.info", app_info_path(game_dir)),
+                          ("diag/launcher.json", launcher_json_path(game_dir))):
+            if os.path.isfile(real):
+                zf.writestr(arc, _tail_bytes(real))
+        stories = stories_path(game_dir)
+        if os.path.isfile(stories):
+            zf.writestr("diag/plugin/stories.json", _tail_bytes(stories))
+    return zip_path, lines
+
+
+def _diag_encode_endpoint(url: str, token: str) -> str:
+    """把 ``(url, token)`` 编成 base64 串,供 launcher.json 的隐身字段 ``diag_endpoint``
+    使用(避免明文 IP/令牌直接落在配置里被 grep 到;非加密,仅防顺手扫)。"""
+    import base64
+    raw = (url or "") + "\n" + (token or "")
+    return base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _diag_decode_endpoint(value) -> tuple:
+    """解 ``diag_endpoint``,返回 ``(url, token)``;非法/空返回 ``("", "")``。"""
+    import base64
+    if not value:
+        return "", ""
+    try:
+        raw = base64.b64decode(str(value)).decode("utf-8", errors="replace")
+        url, _, token = raw.partition("\n")
+        return url.strip(), token.strip()
+    except (ValueError, TypeError):
+        return "", ""
+
+
+def _diag_upload_target(game_dir: str) -> tuple:
+    """解析上传目标 ``(url, token)``:环境变量优先,其次 ``launcher.json``。
+
+    ``launcher.json`` 支持两种写法:明文 ``diag_upload_url``/``diag_upload_token``,
+    或隐身的 ``diag_endpoint``(base64 编码的 ``url\\ntoken``)。二者都在时以明文字段优先。
+    """
+    url = os.environ.get(DIAG_UPLOAD_URL_ENV, "").strip()
+    token = os.environ.get(DIAG_UPLOAD_TOKEN_ENV, "").strip()
+    if not url:
+        path = launcher_json_path(game_dir)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle) or {}
+                url = str(data.get("diag_upload_url") or "").strip()
+                token = token or str(data.get("diag_upload_token") or "").strip()
+                if not url:
+                    eu, et = _diag_decode_endpoint(data.get("diag_endpoint"))
+                    url = url or eu
+                    token = token or et
+            except (OSError, json.JSONDecodeError):
+                pass
+    return url, token
+
+
+def _diag_summary_from_zip(zip_path: str) -> str:
+    """从诊断 zip 里取 ``diag/diag_summary.txt`` 文本(取不到返回空串)。"""
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            if "diag/diag_summary.txt" in zf.namelist():
+                return zf.read("diag/diag_summary.txt").decode("utf-8", errors="replace")
+    except (OSError, zipfile.BadZipFile, KeyError):
+        pass
+    return ""
+
+
+def _multipart_part(boundary: str, name: str, filename, content: bytes,
+                    content_type: str) -> bytes:
+    """构造一个 multipart/form-data 分节;``filename`` 为 None 时是纯文本字段。"""
+    disp = 'Content-Disposition: form-data; name="%s"' % name
+    if filename is not None:
+        disp += '; filename="%s"' % filename
+    head = ("--%s\r\n" % boundary) + (disp + "\r\n") + \
+           ("Content-Type: %s\r\n\r\n" % content_type)
+    return head.encode("utf-8") + content + b"\r\n"
+
+
+def upload_diagnostics(game_dir: str, zip_path: str, url: str = None,
+                       token: str = None) -> tuple:
+    """把诊断包上传到配置的目标。返回 ``(状态, 说明)``,状态为 skipped/ok/error。
+
+    未配置 url 时**只保留本地 zip 并跳过**,绝不猜测端点(上传目标需显式配置:
+    环境变量 ``DOTABYSS_DIAG_UPLOAD_URL``,或 launcher.json 的 ``diag_upload_url``)。
+    发送为标准 multipart/form-data:文件字段 ``file``(zip)+ 文本字段 ``summary``
+    (诊断摘要纯文本,便于接收端无需解压即可成文);可选 Bearer 令牌。
+    """
+    if url is None or token is None:
+        cfg_url, cfg_token = _diag_upload_target(game_dir)
+        url = cfg_url if url is None else url
+        token = cfg_token if token is None else token
+    if not url:
+        return "skipped", "未配置上传目标(设 %s 或 launcher.json 的 diag_upload_url);诊断包已保存在:%s" % (
+            DIAG_UPLOAD_URL_ENV, zip_path)
+    import urllib.error
+    import urllib.request
+    try:
+        payload = _tail_bytes(zip_path, max_bytes=64 * 1024 * 1024)
+        summary = _diag_summary_from_zip(zip_path)[:64 * 1024]
+        boundary = "----dotabyssdiag%d" % int(time.time() * 1000)
+        fname = os.path.basename(zip_path)
+        parts = [_multipart_part(boundary, "file", fname, payload, "application/zip")]
+        if summary:
+            parts.append(_multipart_part(boundary, "summary", None,
+                                         summary.encode("utf-8"), "text/plain; charset=utf-8"))
+        body = b"".join(parts) + ("--%s--\r\n" % boundary).encode("utf-8")
+        headers = {"Content-Type": "multipart/form-data; boundary=%s" % boundary,
+                   "Content-Length": str(len(body))}
+        if token:
+            headers["Authorization"] = "Bearer %s" % token
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(request, timeout=DIAG_UPLOAD_TIMEOUT) as response:
+            code = getattr(response, "status", None) or response.getcode()
+            return "ok", "已上传(HTTP %s):%s" % (code, url)
+    except urllib.error.HTTPError as error:
+        return "error", "上传被拒(HTTP %s):%s" % (error.code, url)
+    except (urllib.error.URLError, OSError) as error:
+        return "error", "上传失败:%s" % error

@@ -1,0 +1,20 @@
+# ドットアビスX 诊断包接收端 —— Cloudflare Workers + R2 + GitHub Issue 转发配置
+# 部署前需:1) `npm i -g wrangler`(或直接用 npx wrangler)  2) `wrangler login`(用你的 CF 账号)
+#        3) 建 R2 桶 `dotabyss-diag`  4) 填 account_id  5) 建一个目标仓库的 fine-grained PAT
+# 密钥(secret,绝不写进本文件):`wrangler secret put UPLOAD_TOKEN`、`wrangler secret put GITHUB_TOKEN`
+
+name = "dotabyss-diag-collector"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# 替换成你的 Cloudflare 账户 ID(dashboard 右侧可查)
+account_id = ""
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "dotabyss-diag"
+
+[vars]
+# 诊断日志 Issue 落到哪个 GitHub 仓库(owner/name)。GitHub 令牌本身用 secret 注入,不写这里。
+GITHUB_REPO = "your-user/your-repo"
+BUCKET_NAME = "dotabyss-diag"

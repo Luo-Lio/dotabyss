@@ -255,8 +255,15 @@ def write_version_and_repo(out_dir: str, version: str, repo: str, src: str,
         "first_ready": False,
     }
     core.save_version(out_dir, data)
+    launcher_cfg = {"github_repo": repo}
+    # 诊断日志回传端点:仅在构建环境配了 URL 时写入,且以 base64 隐身字段落盘
+    # (真实 IP/令牌不进 Git、也不以明文出现在随包 launcher.json)。
+    diag_url = os.environ.get("DOTABYSS_DIAG_UPLOAD_URL", "").strip()
+    diag_token = os.environ.get("DOTABYSS_DIAG_UPLOAD_TOKEN", "").strip()
+    if diag_url:
+        launcher_cfg["diag_endpoint"] = core._diag_encode_endpoint(diag_url, diag_token)
     with open(core.launcher_json_path(out_dir), "w", encoding="utf-8", newline="\n") as handle:
-        json.dump({"github_repo": repo}, handle, ensure_ascii=False, indent=2)
+        json.dump(launcher_cfg, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
     return data
 
