@@ -210,6 +210,7 @@ public class Plugin : BasePlugin
 
         AddComponent<ViewerBehaviour>();
         InstallUnobservedExceptionHook();
+        DeployRuntimeConfigIfNeeded();
         if (OfflineApi.Value)
         {
             ApiServer = new OfflineApiServer(OfflineApiPort.Value);
@@ -313,6 +314,49 @@ public class Plugin : BasePlugin
         catch (Exception e)
         {
             Log.LogWarning($"离线模式:版本信息读取失败: {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 0.7.22:部署 AbsfRuntimeConfig.dat(如果 persistentDataPath 下缺失)。
+    /// <para>
+    /// 全新安装的玩家从未成功联网启动过 → 游戏持久化目录里没有这个配置文件 →
+    /// AppEngine.InitializeServicesAsync 走到 OnServiceRegistered 时读到 null → 崩溃。
+    /// 本方法在插件加载早期(场景尚未开始)检测并补全,让引擎初始化能正常完成。
+    /// </para>
+    /// </summary>
+    private void DeployRuntimeConfigIfNeeded()
+    {
+        try
+        {
+            string persistent = UnityEngine.Application.persistentDataPath;
+            string target = System.IO.Path.Combine(persistent, "AbsfRuntimeConfig.dat");
+            if (System.IO.File.Exists(target)) return;
+
+            // 从嵌入资源释放
+            var asm = typeof(Plugin).Assembly;
+            string resName = null;
+            foreach (var n in asm.GetManifestResourceNames())
+            {
+                if (n.EndsWith("AbsfRuntimeConfig.dat", StringComparison.OrdinalIgnoreCase))
+                { resName = n; break; }
+            }
+            if (resName == null)
+            {
+                Log.LogWarning("[启动容错] 嵌入资源 AbsfRuntimeConfig.dat 未编入 DLL,无法补全");
+                return;
+            }
+            using (var stream = asm.GetManifestResourceStream(resName))
+            {
+                System.IO.Directory.CreateDirectory(persistent);
+                using (var fs = System.IO.File.Create(target))
+                    stream.CopyTo(fs);
+            }
+            Log.LogInfo($"[启动容错] 已释放 AbsfRuntimeConfig.dat → {target} ({new System.IO.FileInfo(target).Length}B)");
+        }
+        catch (Exception e)
+        {
+            Log.LogWarning($"[启动容错] AbsfRuntimeConfig 部署失败: {e.GetType().Name}: {e.Message}");
         }
     }
 
