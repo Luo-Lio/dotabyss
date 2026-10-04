@@ -1392,11 +1392,20 @@ def _diag_decode_endpoint(value) -> tuple:
         return "", ""
 
 
-def _diag_upload_target(game_dir: str) -> tuple:
-    """解析上传目标 ``(url, token)``:环境变量优先,其次 ``launcher.json``。
+# 构建期由 make_diag_default.py 生成的内建默认端点(base64,明文不进仓库);
+# 随 freeze 烘进启动器 exe,作为老玩家 launcher.json 无端点时的兜底。缺失则为空。
+try:
+    from dotabyss_diag_default import ENDPOINT_B64 as _DIAG_EMBED_B64  # type: ignore
+except Exception:  # noqa: BLE001 - 模块不存在(源码运行/未生成)视为无内建默认
+    _DIAG_EMBED_B64 = ""
 
-    ``launcher.json`` 支持两种写法:明文 ``diag_upload_url``/``diag_upload_token``,
-    或隐身的 ``diag_endpoint``(base64 编码的 ``url\\ntoken``)。二者都在时以明文字段优先。
+
+def _diag_upload_target(game_dir: str) -> tuple:
+    """解析上传目标 ``(url, token)``。优先级:环境变量 → ``launcher.json`` → 内建默认。
+
+    ``launcher.json`` 支持明文 ``diag_upload_url``/``diag_upload_token`` 或隐身
+    ``diag_endpoint``(base64 ``url\\ntoken``);都未命中时回退到冻结入 exe 的
+    ``_DIAG_EMBED_B64``(使老玩家仅更新启动器也能回传)。都无则返回空(仅本地 zip)。
     """
     url = os.environ.get(DIAG_UPLOAD_URL_ENV, "").strip()
     token = os.environ.get(DIAG_UPLOAD_TOKEN_ENV, "").strip()
@@ -1414,6 +1423,10 @@ def _diag_upload_target(game_dir: str) -> tuple:
                     token = token or et
             except (OSError, json.JSONDecodeError):
                 pass
+    if not url and _DIAG_EMBED_B64:
+        eu, et = _diag_decode_endpoint(_DIAG_EMBED_B64)
+        url = url or eu
+        token = token or et
     return url, token
 
 

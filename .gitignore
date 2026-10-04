@@ -16,3 +16,6 @@ client/
 # 打包输出(完整包 8GB 级,禁止入库)
 dist/
 *.zip
+
+# 构建期生成的内建默认端点模块(含编码回传端点,明文不进 Git)
+tools/launcher/dotabyss_diag_default.py

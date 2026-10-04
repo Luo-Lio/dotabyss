@@ -34,9 +34,14 @@ Get-Process -Name 'DotabyssOfflineLauncher*' -ErrorAction SilentlyContinue |
     }
 Start-Sleep -Milliseconds 500
 
+# 冻结前从构建 env 生成内建默认端点模块(gitignore;未设 env 则写空→不内建任何端点)
+& $python (Join-Path $scriptDir 'make_diag_default.py')
+if ($LASTEXITCODE -ne 0) { throw "make_diag_default 失败,退出码 $LASTEXITCODE" }
+
 & $python -m PyInstaller --noconfirm --clean --onefile --noconsole `
     --name DotabyssOfflineLauncher `
     --icon $ico --add-data "$ico;." `
+    --hidden-import dotabyss_diag_default `
     --distpath $gameDir --workpath $build --specpath $build `
     (Join-Path $scriptDir 'dotabyss_launcher.py')
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 失败,退出码 $LASTEXITCODE" }
