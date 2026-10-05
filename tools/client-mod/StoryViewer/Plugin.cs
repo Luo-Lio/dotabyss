@@ -20,7 +20,7 @@ public class Plugin : BasePlugin
     public const string Guid = "dotabyss.storyviewer";
 
     /// <summary>插件版本(必须与 csproj 的 <Version> 保持一致,便于排查与诊断回传)。</summary>
-    public const string Version = "0.7.25";
+    public const string Version = "0.7.26";
 
     /// <summary>共享日志器,供行为组件与播放器使用。</summary>
     internal static ManualLogSource Logger;
@@ -212,7 +212,6 @@ public class Plugin : BasePlugin
         AddComponent<ViewerBehaviour>();
         InstallUnobservedExceptionHook();
         DeployRuntimeConfigIfNeeded();
-        SeedMasterDataIfNeeded();
         if (OfflineApi.Value)
         {
             ApiServer = new OfflineApiServer(OfflineApiPort.Value);
@@ -258,6 +257,7 @@ public class Plugin : BasePlugin
                         try
                         {
                             string msg = e?.Message;
+                            if (NoteHomeCosmeticMasterData(msg)) return;
                             string stack = e?.StackTrace;
                             Log.LogError($"[未观察异常] {msg}\n{stack}");
                         }
@@ -333,47 +333,31 @@ public class Plugin : BasePlugin
         }
     }
 
+    /// <summary>是否已就地把首页建筑主数据缺失降级为友好提示(只播报一次)。</summary>
+    private bool _homeCosmeticNoted;
+
     /// <summary>
-    /// 0.7.24:播种主数据磁盘缓存(DownloadCache/*.dat)到 persistentDataPath——只补缺失、绝不覆盖。
+    /// 0.7.26:离线固有 —— 首页建筑主数据(MBuildings)不可用的静音处理。
     /// <para>
-    /// Home 场景建建筑列表时 <c>TopScene.CreateBuildingModelListAsync → MasterDataStore.GetCache&lt;MBuildings&gt;()</c>
-    /// 会抛 <c>MBuildings not found</c>:主数据不在 Addressables Caches 也不在通用 API JSON,
-    /// 而是 <c>MasterDataStore</c> 首下写出的 <c>DownloadCache\&lt;hash&gt;.dat</c>。干净安装由启动器/完整包
-    /// 播种 LocalLow;但非启动器安装态(手工拷贝、未走更新)会缺,导致首页主数据缺失。
-    /// 插件目录自带 <c>local_low_seed\DownloadCache</c>,这里在加载早期把它补种到位即可自愈。
-    /// 剧情播放不依赖它(所以缺时也能播),此修复针对首页 UI。
+    /// <c>TopScene.CreateBuildingModelListAsync → MasterDataStore.GetCache&lt;MBuildings&gt;()</c> 抛
+    /// <c>MBuildings not found</c> 是离线版固有的:MasterDataStore 靠下载/清单管线把各表读进**内存**,
+    /// 离线时这条管线不会填充 m_buildings——把磁盘 <c>DownloadCache\&lt;hash&gt;.dat</c> 补上也没用
+    /// (新机模拟已验证:文件在、内容含 m_buildings,进 Home 仍 not found)。所以之前 0.7.24 的
+    /// <c>SeedMasterDataIfNeeded</c> 前提就是错的,已移除。
+    /// 关键点:这**只影响首页建筑渲染**,剧情播出不依赖它(报错照样进 Home、列表照开、剧情照播)。
+    /// 因此这类未观察异常不再刷整页堆栈,只播报一次友好提示。返回 true 表示已就地处理、调用方无需再记。
     /// </para>
     /// </summary>
-    private void SeedMasterDataIfNeeded()
+    private bool NoteHomeCosmeticMasterData(string msg)
     {
-        try
+        if (string.IsNullOrEmpty(msg)) return false;
+        if (!msg.Contains("MBuildings")) return false;
+        if (!_homeCosmeticNoted)
         {
-            string persistent = UnityEngine.Application.persistentDataPath;
-            string targetDir = System.IO.Path.Combine(persistent, "DownloadCache");
-            string srcDir = System.IO.Path.Combine(Paths.PluginPath, "StoryViewer", "local_low_seed", "DownloadCache");
-            if (!System.IO.Directory.Exists(srcDir))
-            {
-                Log.LogInfo($"[主数据播种] 插件目录无种子({srcDir}),跳过(依赖启动器/完整包播种)");
-                return;
-            }
-            int copied = 0, skipped = 0;
-            foreach (var src in System.IO.Directory.GetFiles(srcDir, "*.dat"))
-            {
-                string dst = System.IO.Path.Combine(targetDir, System.IO.Path.GetFileName(src));
-                if (System.IO.File.Exists(dst)) { skipped++; continue; }
-                System.IO.Directory.CreateDirectory(targetDir);
-                System.IO.File.Copy(src, dst, false);
-                copied++;
-            }
-            if (copied > 0)
-                Log.LogInfo($"[主数据播种] 已补种 {copied} 个 DownloadCache .dat → {targetDir}(跳过已存在 {skipped} 个)");
-            else
-                Log.LogInfo($"[主数据播种] 已就绪(无需补种,本地现有 {skipped} 个)");
+            _homeCosmeticNoted = true;
+            Log.LogInfo("[首页建筑] 离线无主数据(MBuildings not found):仅影响首页建筑渲染,剧情播出不受影响(此提示只显示一次)。");
         }
-        catch (Exception e)
-        {
-            Log.LogWarning($"[主数据播种] 失败(不致命,首页建筑可能缺失): {e.Message}");
-        }
+        return true;
     }
 
     /// <summary>
