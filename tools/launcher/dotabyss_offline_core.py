@@ -507,13 +507,36 @@ def load_version(game_dir: str) -> dict:
     """读取离线版本元数据;缺失时返回带默认值的独立副本。"""
     path = version_path(game_dir)
     if not os.path.isfile(path):
-        return {"version": "", "baseline": "", "channel": "", "plugin_version": "", "first_ready": False}
+        return {"version": "", "baseline": "", "channel": "", "plugin_version": "",
+                "notice": "", "first_ready": False}
     try:
         with open(path, "r", encoding="utf-8") as version_file:
             data = json.load(version_file)
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
-        return {"version": "", "baseline": "", "channel": "", "plugin_version": "", "first_ready": False}
+        return {"version": "", "baseline": "", "channel": "", "plugin_version": "",
+                "notice": "", "first_ready": False}
+
+
+def version_notice(data) -> str:
+    """从版本元数据提取公告文本,异常或非字符串字段返回空串。
+
+    参数:data 为版本字典,也接受 JSON 文本以便调用方安全处理外部清单。
+    返回:保留换行的公告字符串;空白公告和不可解析 JSON 均返回空串。
+    """
+    if isinstance(data, dict):
+        raw = data.get("notice")
+    elif isinstance(data, (str, bytes, bytearray)):
+        try:
+            parsed = json.loads(data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        raw = parsed.get("notice") if isinstance(parsed, dict) else None
+    else:
+        return ""
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    return raw
 
 
 def save_version(game_dir: str, data: dict) -> None:
@@ -1190,7 +1213,8 @@ DIAG_SIGNATURE_PATTERNS = (
     "runtime.json", "TextDataProvider", "Player Content", "Unable to load runtime",
     "asset is null", "BitConverter", "Value cannot be null", "CriSound",
     "LoadBuiltinSound", "InitializeAsync", "InitializeServicesAsync",
-    "OnServiceRegistered", "ATTPermissionCheck", "RequestAuthorizationAsync",
+    "OnServiceRegistered", "BitConverter.ToBoolean", "ATTPermissionCheck",
+    "RequestAuthorizationAsync",
     "ATTManager", "OnInitializeImplAsync", "场景切换", "未观察异常",
     "Title ATT", "异常已抑制", "MBuildings",
 )
@@ -1390,6 +1414,190 @@ def _diag_stall_analysis(game_dir: str) -> list:
     return out
 
 
+def _diag_physical_memory_bytes():
+    """返回物理内存总量字节数;平台不支持或读取失败时返回 ``None``。"""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                """Windows ``MEMORYSTATUSEX`` 结构。"""
+
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatus()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys)
+            return None
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        page_count = os.sysconf("SC_PHYS_PAGES")
+        return int(page_size) * int(page_count)
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        return None
+
+
+def _diag_machine_info_lines() -> list:
+    """生成机器信息区块;每项独立容错,不因单项不可得中断诊断包。"""
+    import locale
+    import platform
+    import struct
+    import sys
+
+    lines = ["--- 机器信息 ---"]
+    try:
+        lines.append("platform.system=%s" % platform.system())
+    except Exception:  # noqa: BLE001 - 诊断字段失败不应中断收集
+        pass
+    try:
+        lines.append("platform.release=%s" % platform.release())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        lines.append("platform.version=%s" % platform.version())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        lines.append("platform.machine=%s" % platform.machine())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        win32 = platform.win32_ver()
+        lines.append("platform.win32_ver=%s" % "/".join(str(part) for part in win32 if part))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        winver = sys.getwindowsversion()
+        version = "%d.%d.%d" % (winver.major, winver.minor, winver.build)
+        platform_version = getattr(winver, "platform_version", "") or "(不可得)"
+        lines.append("Windows 构建号=%s; platform_version=%s" % (version, platform_version))
+        lines.append("是否 Windows 11(build>=22000):%s" % (
+            "是" if winver.build >= 22000 else "否"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    try:
+        lines.append("Python 版本=%s" % platform.python_version())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        lines.append("区域/locale=%s" % locale.getpreferredencoding(False))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        lines.append("进程位数=%d" % (struct.calcsize("P") * 8))
+    except (struct.error, TypeError, ValueError):
+        pass
+    try:
+        lines.append("CPU 逻辑核数=%s" % (os.cpu_count() or "不可得"))
+    except Exception:  # noqa: BLE001
+        pass
+    memory = _diag_physical_memory_bytes()
+    if memory is not None:
+        lines.append("物理内存=%d 字节(约 %.2f GB)" % (memory, memory / (1 << 30)))
+    return lines
+
+
+def _diag_directory_probe(label: str, path: str) -> str:
+    """返回目录存在性与顶层条目数,不返回目录中的任何名称。"""
+    try:
+        if not os.path.isdir(path):
+            return "%s:存在=否 顶层条目数=0" % label
+    except (OSError, TypeError):
+        return "%s:存在=探测失败 顶层条目数=不可得" % label
+    try:
+        count = len(os.listdir(path))
+    except (OSError, TypeError):
+        count = "读取失败"
+    return "%s:存在=是 顶层条目数=%s" % (label, count)
+
+
+def _diag_registry_probe() -> str:
+    """探测 HKCU 目标键并仅返回其子键名,绝不读取注册表值。"""
+    label = r"HKCU\Software\EXNOA LLC."
+    try:
+        import winreg
+    except ImportError:
+        return "%s:不可用(当前 Python 无 winreg)" % label
+    key = None
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\EXNOA LLC.")
+    except FileNotFoundError:
+        return "%s:存在=否 子键数=0" % label
+    except OSError:
+        return "%s:存在=探测失败 子键数=不可得" % label
+    names = []
+    try:
+        index = 0
+        while True:
+            try:
+                names.append(str(winreg.EnumKey(key, index)))
+                index += 1
+            except OSError:
+                break
+        return "%s:存在=是 子键数=%d 子键名=%s" % (
+            label, len(names), "、".join(names) if names else "(无)")
+    except (OSError, TypeError, ValueError):
+        return "%s:存在=是 子键数=读取失败" % label
+    finally:
+        try:
+            winreg.CloseKey(key)
+        except (OSError, TypeError):
+            pass
+
+
+def _diag_machine_state_lines() -> list:
+    """生成机器侧路径元数据区块,不读取或收集 DMM 登录态内容。"""
+    userprofile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    appdata = os.environ.get("APPDATA") or os.path.join(userprofile, "AppData", "Roaming")
+    localappdata = os.environ.get("LOCALAPPDATA") or os.path.join(userprofile, "AppData", "Local")
+    locallow = os.path.join(userprofile, "AppData", "LocalLow", "EXNOA LLC_")
+    lines = ["--- 机器侧状态(路径探测,仅元数据) ---"]
+    probes = (
+        (r"在线身份目录(%USERPROFILE%\AppData\LocalLow\EXNOA LLC_\ドットアビスX)",
+         os.path.join(locallow, "ドットアビスX")),
+        (r"离线身份目录(%USERPROFILE%\AppData\LocalLow\EXNOA LLC_\ドットアビスX_offline)",
+         os.path.join(locallow, "ドットアビスX_offline")),
+        (r"DMM Game Player(%APPDATA%\dmmgameplayer5)",
+         os.path.join(appdata, "dmmgameplayer5")),
+        (r"DMM 更新器(%LOCALAPPDATA%\dmmgameplayer5-updater)",
+         os.path.join(localappdata, "dmmgameplayer5-updater")),
+    )
+    for label, path in probes:
+        try:
+            lines.append(_diag_directory_probe(label, path))
+        except Exception:  # noqa: BLE001 - 单项失败不影响其它探测
+            lines.append("%s:探测失败" % label)
+    try:
+        lines.append(_diag_registry_probe())
+    except Exception:  # noqa: BLE001
+        lines.append(r"HKCU\Software\EXNOA LLC.:探测失败")
+
+    runtime_path = os.path.join(
+        locallow, "ドットアビスX_offline", "AbsfRuntimeConfig.dat")
+    try:
+        if os.path.isfile(runtime_path):
+            try:
+                size = os.path.getsize(runtime_path)
+            except OSError:
+                size = "读取失败"
+            lines.append("AbsfRuntimeConfig.dat:存在=是 大小=%s 字节" % size)
+        else:
+            lines.append("AbsfRuntimeConfig.dat:存在=否 大小=0 字节")
+    except (OSError, TypeError):
+        lines.append("AbsfRuntimeConfig.dat:存在=探测失败 大小=不可得")
+    return lines
+
+
 def _diag_summary_lines(game_dir: str) -> list:
     """生成诊断摘要文本行(静态环境 + 关键运行时指标 + 自检/探针结果)。"""
     import platform
@@ -1403,6 +1611,19 @@ def _diag_summary_lines(game_dir: str) -> list:
         lines.append("游戏进程:%s" % ("运行中" if game_running() else "未运行"))
     except Exception as error:  # noqa: BLE001
         lines.append("游戏进程:探测失败 %s" % error)
+
+    lines.append("")
+    try:
+        lines.extend(_diag_machine_info_lines())
+    except Exception as error:  # noqa: BLE001
+        lines.append("--- 机器信息 ---")
+        lines.append("机器信息获取异常:%s" % error)
+    lines.append("")
+    try:
+        lines.extend(_diag_machine_state_lines())
+    except Exception as error:  # noqa: BLE001
+        lines.append("--- 机器侧状态(路径探测,仅元数据) ---")
+        lines.append("机器侧状态获取异常:%s" % error)
 
     # 启动时间线与卡点定位放在最前面:接收端无需逐行翻日志就能看出“走到哪、卡在哪”。
     lines.append("")

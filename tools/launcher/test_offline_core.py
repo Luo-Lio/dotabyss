@@ -241,6 +241,26 @@ class VersionFileTest(unittest.TestCase):
         self.assertEqual(second["version"], "")
 
 
+class VersionNoticeTest(unittest.TestCase):
+    """version_notice:公告字段的存在、缺失、空值、换行与坏 JSON。"""
+
+    def test_notice_present(self):
+        self.assertEqual(core.version_notice({"notice": "维护完成"}), "维护完成")
+
+    def test_notice_missing(self):
+        self.assertEqual(core.version_notice({"version": "20261006"}), "")
+
+    def test_notice_empty_string(self):
+        self.assertEqual(core.version_notice({"notice": ""}), "")
+
+    def test_notice_preserves_newlines(self):
+        self.assertEqual(core.version_notice('{"notice":"第一行\\n第二行"}'),
+                         "第一行\n第二行")
+
+    def test_unparseable_json_does_not_raise(self):
+        self.assertEqual(core.version_notice("{not json"), "")
+
+
 class ConfigStatusRepairTest(unittest.TestCase):
     """offline_config_status / repair_config:齐全/缺失/错值/保留其它段。"""
 
@@ -1084,6 +1104,11 @@ class CollectDiagnosticsTest(unittest.TestCase):
         self.assertIn("累计命中 36", text)
         self.assertIn("0.7.19", text)
         self.assertIn("baseline=20260924", text)
+        self.assertIn("--- 机器信息 ---", text)
+        self.assertIn("--- 机器侧状态(路径探测,仅元数据) ---", text)
+        self.assertNotIn("authAccessTokenData.enc", text)
+        self.assertNotIn("dmmgame.cnf", text)
+        self.assertNotIn("dmmgameuser.cnf", text)
 
     def test_upload_skipped_without_target(self):
         os.environ.pop(core.DIAG_UPLOAD_URL_ENV, None)

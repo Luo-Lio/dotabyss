@@ -4,7 +4,7 @@
     k=剧情 key(scriptId) / t=标题 / s=系列 / c=角色 / ch=章节或分组 / r18
     g=列表分组标题(主线=「第N章 章名」,活动/支线=活动名,其余=角色名)
     n=主线章节号(用于列表里的金色章号;非主线为 0)
-    中文(取自 AbyssMod 的汉化缓存,缺失时为空,界面回退日文):
+    中文(先取 AbyssMod 的汉化缓存,再由仓库内补充词典覆盖,缺失时为空,界面回退日文):
     tz=中文标题 / cz=中文角色 / chz=中文章节 / dz=中文简介
     分段(前篇/后篇,脚本 key 末位是段号;主数据只有前篇行,续篇继承前篇元数据):
     part=段号(1=前篇) / parts=该故事总段数
@@ -14,6 +14,7 @@
 
 用法: python tools/client-mod/gen_stories_json.py
 汉化缓存: <client>/BepInEx/plugins/AbyssMod/cache/translations/{static,names}/zh_Hans.json
+(仓库内补充: tools/client-mod/i18n/story_zh_supplement.json;同键覆盖缓存)
 (缓存不存在时自动跳过汉化,只输出日文)
 """
 from __future__ import annotations
@@ -36,13 +37,15 @@ OUT = os.path.join(HERE, "StoryViewer", "stories.json")
 TRANSLATIONS = os.path.join(
     PROJECT_ROOT, "client", "BepInEx", "plugins", "AbyssMod", "cache", "translations"
 )
+SUPPLEMENT = os.path.join(HERE, "i18n", "story_zh_supplement.json")
 
 
 def build_zh_map() -> dict[str, str]:
-    """汇总 AbyssMod 汉化缓存里的全部「日文 → 中文」字符串映射。
+    """汇总汉化来源里的全部「日文 → 中文」字符串映射。
 
     static/zh_Hans.json 形如 {表名: {字段: {日文: 中文}}},names/zh_Hans.json 是
     {日文名: 中文名};把标题/简介/角色/章节都并进一张大表,避免逐表挑字段。
+    最后加载仓库内补充词典,使其同键翻译覆盖缓存;补充文件缺失或损坏时仅提示。
     """
     out: dict[str, str] = {}
     static_path = os.path.join(TRANSLATIONS, "static", "zh_Hans.json")
@@ -67,6 +70,19 @@ def build_zh_map() -> dict[str, str]:
                             out.setdefault(jp, zh)
     except FileNotFoundError:
         print(f"提示: 未找到汉化主数据表 {static_path},标题保持日文")
+
+    # 补充词典属于仓库源码,优先级高于可随 AbyssMod 更新而变化的缓存。
+    # 它是可选输入:缺失、JSON 损坏或顶层类型不对都不应改变旧流程的成功/失败行为。
+    try:
+        with open(SUPPLEMENT, encoding="utf-8") as fh:
+            supplement = json.load(fh)
+        if not isinstance(supplement, dict):
+            raise ValueError("顶层必须是对象")
+        out.update({k: v for k, v in supplement.items() if isinstance(k, str) and k and isinstance(v, str)})
+    except FileNotFoundError:
+        print(f"提示: 未找到剧情补充词典 {SUPPLEMENT},继续使用汉化缓存")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        print(f"提示: 剧情补充词典不可用 {SUPPLEMENT} ({exc}),继续使用汉化缓存")
     return out
 
 

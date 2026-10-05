@@ -5,6 +5,7 @@
 用法(开发机):
   D:\\Python\\python.exe build_github_pack.py                       # 版本号默认当天
   D:\\Python\\python.exe build_github_pack.py --notes "本次更新说明"
+  D:\\Python\\python.exe build_github_pack.py --notice "给玩家的公告"
   D:\\Python\\python.exe build_github_pack.py --caches-since <旧完整包目录>   # 生成素材增量
 
 产出 <仓库>\\dist\\release_<版本>\\:
@@ -108,6 +109,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="构建 GitHub 更新资产")
     parser.add_argument("--version", default=time.strftime("%Y%m%d"), help="版本号(默认当天)")
     parser.add_argument("--notes", default="", help="更新说明(写进 version.json)")
+    parser.add_argument("--notice", default="", help="玩家公告(写进 version.json,允许换行)")
     parser.add_argument("--pack", default=DEFAULT_PACK, help="完整包目录(默认 dist/ドットアビスX离线版)")
     parser.add_argument("--baseline", default="", help="基线版本号(默认取完整包 offline_version.json)")
     parser.add_argument("--channel", default="", help="更新通道(默认取完整包;再默认 baseline)")
@@ -184,6 +186,7 @@ def main() -> int:
         "baseline": baseline,
         "channel": channel,
         "notes": args.notes,
+        "notice": args.notice,
         "plugin_version": core.plugin_file_version(pack),
         "plugin_md5": core.file_md5(plugin_dll),
         "stories_md5": core.file_md5(stories),

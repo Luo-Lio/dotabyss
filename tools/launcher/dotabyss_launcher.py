@@ -57,6 +57,7 @@ FONT_START = ("Microsoft YaHei UI", 14, "bold")
 FONT_LOG = ("Consolas", 9)
 GITHUB_UA = "dotabyss-offline-launcher"
 ICO_NAME = "dotabyss_launcher.ico"
+ADV_BUTTON_GAP = 8
 
 
 def resolve_icon_path(frozen, meipass, script_dir, exe_dir=None):
@@ -276,6 +277,7 @@ def _tk_button(parent, text, command, bg, hover, fg=C_FG, font=FONT, padx=18, pa
         parent, text=text, command=command, bg=bg, fg=fg, font=font,
         activebackground=hover, activeforeground=fg, bd=0, relief="flat",
         padx=padx, pady=pady, cursor="hand2",
+        highlightthickness=0, highlightbackground=C_BG, highlightcolor=C_START_HOVER,
         disabledforeground=C_FAINT,
     )
 
@@ -291,6 +293,17 @@ def _tk_button(parent, text, command, bg, hover, fg=C_FG, font=FONT, padx=18, pa
 
     btn.bind("<Enter>", _enter)
     btn.bind("<Leave>", _leave)
+
+    def _focus_in(_event, target=btn):
+        """为键盘聚焦按钮显示与启动色一致的可见焦点。"""
+        target.configure(highlightthickness=1)
+
+    def _focus_out(_event, target=btn):
+        """按钮失去键盘焦点时移除焦点描边。"""
+        target.configure(highlightthickness=0)
+
+    btn.bind("<FocusIn>", _focus_in)
+    btn.bind("<FocusOut>", _focus_out)
     return btn
 
 
@@ -361,6 +374,11 @@ class App:
         self._auto_logs = []
         self._quiet_tried = False
         self._closing = False
+        self._notice_frame = None
+        self._notice_text = None
+        self._adv_buttons = []
+        self._adv_layout_pending = False
+        self._offline_hint_logged = False
         root.title("ドットアビスX 离线启动器")
         root.geometry("520x420")
         root.minsize(480, 360)
@@ -379,6 +397,10 @@ class App:
                 pass
         self._style()
         self._build()
+        root.update_idletasks()
+        screen_height_limit = root.winfo_screenheight() - 120
+        default_height = max(420, min(root.winfo_reqheight(), screen_height_limit))
+        root.geometry("520x%d" % default_height)
         self._poll_queue()
         if smoke_out:
             root.after(3000, lambda: self._smoke_done(smoke_out))
@@ -412,7 +434,7 @@ class App:
         return "—"
 
     def _build(self):
-        """构建顶栏、主按钮、日志、可折叠高级区。"""
+        """构建顶栏、主按钮、公告、日志、可折叠高级区。"""
         header = tk.Frame(self.root, bg=C_BG)
         header.pack(fill="x", padx=16, pady=(14, 8))
         titles = tk.Frame(header, bg=C_BG)
@@ -435,10 +457,10 @@ class App:
         self.btn_update.pack(side="left", padx=(10, 0))
 
         log_frame = tk.Frame(self.root, bg=C_PANEL)
-        log_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        self.log_frame = log_frame
         self.txt = tk.Text(
             log_frame, bg=C_LOG_BG, fg=C_FG, font=FONT_LOG, bd=0, relief="flat",
-            wrap="word", state="disabled", height=10, insertbackground=C_FG,
+            wrap="word", state="disabled", height=8, insertbackground=C_FG,
             highlightthickness=0)
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=scrollbar.set)
@@ -449,38 +471,125 @@ class App:
         self.txt.tag_configure("err", foreground=C_ERR)
         self.txt.tag_configure("dim", foreground=C_FG)
 
+        footer = tk.Frame(self.root, bg=C_BG)
         self.btn_adv = _tk_button(
-            self.root, "高级 ▾", self._toggle_advanced, C_BTN, C_BTN_HOVER,
+            footer, "高级 ▾", self._toggle_advanced, C_BTN, C_BTN_HOVER,
             padx=12, pady=4)
         self.btn_adv.pack(anchor="w", padx=16, pady=(0, 4))
-        self.adv_frame = tk.Frame(self.root, bg=C_BG)
+        self.adv_frame = tk.Frame(footer, bg=C_BG)
+        self.adv_buttons_frame = tk.Frame(self.adv_frame, bg=C_BG)
+        self.adv_buttons_frame.pack_propagate(False)
+        self.adv_buttons_frame.pack(fill="x")
         self.btn_check = _tk_button(
-            self.adv_frame, "自检", self.run_check, C_BTN, C_BTN_HOVER)
+            self.adv_buttons_frame, "自检", self.run_check, C_BTN, C_BTN_HOVER, padx=9)
         self.btn_probe = _tk_button(
-            self.adv_frame, "索引探针", self.run_index_probe, C_BTN, C_BTN_HOVER)
+            self.adv_buttons_frame, "索引探针", self.run_index_probe, C_BTN, C_BTN_HOVER,
+            padx=9)
         self.btn_repair = _tk_button(
-            self.adv_frame, "修复", self.run_repair, C_BTN, C_BTN_HOVER)
+            self.adv_buttons_frame, "修复", self.run_repair, C_BTN, C_BTN_HOVER, padx=9)
         self.btn_logs = _tk_button(
-            self.adv_frame, "打开日志", self.open_logs, C_BTN, C_BTN_HOVER)
+            self.adv_buttons_frame, "打开日志", self.open_logs, C_BTN, C_BTN_HOVER, padx=9)
         self.btn_diag = _tk_button(
-            self.adv_frame, "收集日志", self.run_diag, C_BTN, C_BTN_HOVER)
+            self.adv_buttons_frame, "收集日志", self.run_diag, C_BTN, C_BTN_HOVER, padx=9)
         self.btn_offline = _tk_button(
-            self.adv_frame, "离线更新包", self.run_update_offline, C_BTN, C_BTN_HOVER)
-        self.btn_check.pack(side="left")
-        self.btn_probe.pack(side="left", padx=8)
-        self.btn_repair.pack(side="left")
-        self.btn_logs.pack(side="left", padx=8)
-        self.btn_diag.pack(side="left")
-        self.btn_offline.pack(side="left", padx=8)
+            self.adv_buttons_frame, "离线更新包 (.zip)", self.run_update_offline,
+            C_BTN, C_BTN_HOVER, padx=9)
+        self._adv_buttons = [
+            self.btn_check, self.btn_probe, self.btn_repair,
+            self.btn_logs, self.btn_diag, self.btn_offline,
+        ]
+        self.adv_frame.bind("<Configure>", self._on_advanced_configure)
+        self.adv_buttons_frame.bind("<Configure>", self._on_advanced_configure)
         self._advanced_open = False
         self._btns = [
             self.btn_start, self.btn_update, self.btn_check, self.btn_probe,
             self.btn_repair, self.btn_logs, self.btn_diag, self.btn_offline, self.btn_adv,
         ]
+
+        # 底部固定区块先打包,日志区随后吸收剩余空间,公告最后叠到日志上方。
+        footer.pack(side="bottom", fill="x")
+        log_frame.pack(side="bottom", fill="both", expand=True, padx=16, pady=(0, 8))
+        self._build_notice()
+
         self.log("游戏目录:%s" % self.game_dir, "dim")
         if self._plugin_version_full:
             self.log("插件完整版本: %s" % self._plugin_version_full, "dim")
 
+    def _build_notice(self):
+        """构建可滚动的只读公告区;无公告时不占主界面空间。"""
+        self._notice_frame = tk.Frame(self.root, bg=C_PANEL)
+        title = tk.Label(self._notice_frame, text="公告", bg=C_PANEL, fg=C_OK,
+                         font=FONT, anchor="w")
+        title.pack(fill="x", padx=8, pady=(6, 2))
+        self._notice_text = tk.Text(
+            self._notice_frame, bg=C_LOG_BG, fg=C_FG, font=FONT, bd=0,
+            relief="flat", wrap="word", state="disabled", height=3,
+            insertbackground=C_FG, highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            self._notice_frame, orient="vertical", command=self._notice_text.yview)
+        self._notice_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y", padx=(0, 6), pady=(0, 6))
+        self._notice_text.pack(fill="both", expand=True, padx=(8, 0), pady=(0, 6))
+        self._refresh_notice()
+
+    def _refresh_notice(self):
+        """从本地版本元数据刷新公告;缺失或空公告时隐藏公告区。"""
+        if self._notice_text is None or self._notice_frame is None:
+            return
+        notice = c.version_notice(c.load_version(self.game_dir))
+        self._notice_text.configure(state="normal")
+        self._notice_text.delete("1.0", "end")
+        if notice:
+            self._notice_text.insert("1.0", notice)
+        self._notice_text.configure(state="disabled")
+        if notice:
+            if not self._notice_frame.winfo_ismapped():
+                # 关键:公告排在日志区之前分配空间。空间不足或高级区展开时,
+                # 只让日志区收缩,公告与底部高级区都保持自身高度(否则公告会被压成半行)。
+                self._notice_frame.pack(fill="x", padx=16, pady=(0, 8),
+                                        before=self.log_frame)
+        elif self._notice_frame.winfo_ismapped():
+            self._notice_frame.pack_forget()
+
+    def _on_advanced_configure(self, _event=None):
+        """窗口或高级区尺寸变化时,安排一次按钮自适应换行。"""
+        if self._advanced_open and not self._adv_layout_pending:
+            self._adv_layout_pending = True
+            self.root.after_idle(self._layout_advanced_buttons)
+
+    def _layout_advanced_buttons(self):
+        """按按钮请求宽度把高级动作排成尽可能少的行。"""
+        self._adv_layout_pending = False
+        if not self._advanced_open:
+            return
+        width = self.adv_buttons_frame.winfo_width()
+        if width <= 1:
+            width = max(self.root.winfo_width() - 32, 1)
+        for button in self._adv_buttons:
+            button.place_forget()
+        rows = []
+        for button in self._adv_buttons:
+            requested = button.winfo_reqwidth()
+            if not rows or rows[-1]["width"] + ADV_BUTTON_GAP + requested > width:
+                rows.append({"buttons": [], "width": 0, "height": 0})
+            row = rows[-1]
+            left = 0 if not row["buttons"] else ADV_BUTTON_GAP
+            row["buttons"].append((button, left))
+            row["width"] += left + requested
+            row["height"] = max(row["height"], button.winfo_reqheight())
+        total_height = sum(row["height"] for row in rows)
+        total_height += ADV_BUTTON_GAP * max(len(rows) - 1, 0)
+        self.adv_buttons_frame.configure(height=total_height)
+        top = 0
+        for row in rows:
+            left = 0
+            for button, gap in row["buttons"]:
+                left += gap
+                button.place(x=left, y=top, width=button.winfo_reqwidth(),
+                             height=button.winfo_reqheight())
+                left += button.winfo_reqwidth()
+            top += row["height"] + ADV_BUTTON_GAP
     def _toggle_advanced(self):
         """展开或收起自检/探针/修复/打开日志。"""
         if self._advanced_open:
@@ -491,6 +600,11 @@ class App:
             self.adv_frame.pack(fill="x", padx=16, pady=(0, 10))
             self.btn_adv.configure(text="高级 ▴")
             self._advanced_open = True
+            if not self._offline_hint_logged:
+                self.log("离线更新包：请选择发布方提供的 .zip 文件（GitHub 连不上时使用）。",
+                         "dim")
+                self._offline_hint_logged = True
+            self.root.after_idle(self._layout_advanced_buttons)
 
     def log(self, text, tag=None):
         """向日志框追加一行(仅主线程)。"""
@@ -517,6 +631,10 @@ class App:
                 return
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__BTN__":
                 self.btn_update.configure(text=item[1])
+                count += 1
+                continue
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__NOTICE__":
+                self._refresh_notice()
                 count += 1
                 continue
             if isinstance(item, tuple) and len(item) == 2:
@@ -1117,6 +1235,9 @@ class App:
                 "catalog_bin_md5", "master_data_md5"):
             if field in remote:
                 updated[field] = remote[field]
+        if "version" in remote:
+            # 公告属于当前 Release;远端未声明时清掉旧公告,避免过期文案残留。
+            updated["notice"] = remote.get("notice", "")
         for remote_field, local_field in (
                 ("client_body", "client_body_zip_md5"),
                 ("caches_added", "caches_added_zip_md5")):
@@ -1158,7 +1279,9 @@ class App:
                 return
             same_version = str(remote.get("version") or "") == str(local.get("version") or "")
             if same_version and self._release_outputs_current(remote, local):
-                self._backfill_remote_records(local, remote)
+                changed = self._backfill_remote_records(local, remote)
+                if changed:
+                    self.q.put(("__NOTICE__", None))
                 self._emit("已是最新。", "ok")
                 return
             if same_version:
@@ -1216,6 +1339,7 @@ class App:
                 "version": remote.get("version", local.get("version")),
                 "baseline": remote.get("baseline", local.get("baseline")),
                 "channel": remote.get("channel", local.get("channel")),
+                "notice": remote.get("notice", ""),
                 "plugin_version": remote.get("plugin_version", local.get("plugin_version")),
                 "plugin_md5": remote.get("plugin_md5", local.get("plugin_md5")),
                 "stories_md5": remote.get("stories_md5", local.get("stories_md5")),
@@ -1238,6 +1362,7 @@ class App:
                 "first_ready": True,
             })
             c.save_version(self.game_dir, new_version)
+            self.q.put(("__NOTICE__", None))
             self._emit("更新完成。", "ok")
             if restart:
                 self._emit("正在重启启动器…", "ok")
@@ -1258,8 +1383,15 @@ class App:
             return
         path = filedialog.askopenfilename(
             parent=self.root, title="选择离线更新包(.zip)",
-            filetypes=[("离线更新包", "*.zip"), ("所有文件", "*.*")])
+            filetypes=[("离线更新包 (*.zip)", "*.zip"), ("所有文件", "*.*")])
         if not path:
+            return
+        if os.path.isdir(path):
+            self.log("离线更新包格式不正确:请选择 .zip 文件,不要选择解压后的文件夹。", "warn")
+            return
+        if not path.lower().endswith(".zip"):
+            self.log("离线更新包格式不正确:请选择以 .zip 结尾的文件。"
+                     "该文件由发布方在 GitHub 无法连接时提供。", "warn")
             return
         self._offline_pack = path
         self._run_bg(self._do_update_offline)

@@ -20,7 +20,7 @@ public class Plugin : BasePlugin
     public const string Guid = "dotabyss.storyviewer";
 
     /// <summary>插件版本(必须与 csproj 的 <Version> 保持一致,便于排查与诊断回传)。</summary>
-    public const string Version = "0.7.27";
+    public const string Version = "0.7.28";
 
     /// <summary>共享日志器,供行为组件与播放器使用。</summary>
     internal static ManualLogSource Logger;
@@ -102,6 +102,9 @@ public class Plugin : BasePlugin
 
     /// <summary>离线时旁路 Title 场景的 ATT(实名/年龄授权)检查:新机器无授权缓存会读 null 崩溃卡在 Title。</summary>
     internal static ConfigEntry<bool> BypassTitleAtt;
+
+    /// <summary>离线时兜底处理 BitConverter 收到 null 字节数组的调用。</summary>
+    internal static ConfigEntry<bool> GuardNullBitConverter;
 
     /// <summary>游戏原本的 API 根地址(重定向到本机前的值,抓包转发用它做上游)。</summary>
     internal static string OriginalApiBase;
@@ -190,6 +193,8 @@ public class Plugin : BasePlugin
             "离线模式:跳过剧情前的「数据下载」确认弹窗(资源都在本地,无需下载)");
         BypassTitleAtt = Config.Bind("Offline", "BypassTitleAtt", true,
             "离线模式:旁路 Title 场景的 ATT(实名/年龄授权)检查。全新机器没有在线版的授权缓存时,游戏在 Title 会读 null 抛 BitConverter.ToBoolean 崩溃、卡在标题进不了首页;离线不需要 ATT,直接判为已通过");
+        GuardNullBitConverter = Config.Bind("Offline", "GuardNullBitConverter", true,
+            "读到空字节时把 BitConverter 结果按默认值处理(离线兜底)");
         ErrorPopupLog = Config.Bind("Debug", "ErrorPopupLog", true,
             "把游戏错误弹窗的内容(errorCode/title/message)写进日志,便于离线排查");
 
@@ -217,6 +222,7 @@ public class Plugin : BasePlugin
         AddComponent<ViewerBehaviour>();
         InstallUnobservedExceptionHook();
         DeployRuntimeConfigIfNeeded();
+        LogMachineSnapshot();
         if (OfflineApi.Value)
         {
             ApiServer = new OfflineApiServer(OfflineApiPort.Value);
@@ -405,6 +411,108 @@ public class Plugin : BasePlugin
         catch (Exception e)
         {
             Log.LogWarning($"[启动容错] AbsfRuntimeConfig 部署失败: {e.GetType().Name}: {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 记录一次启动机器快照,帮助区分 Win10/Win11 以及是否存在官方在线版留下的本地痕迹。
+    /// <para>这里只检查目录/文件/注册表键是否存在及目录顶层条目数量,绝不读取文件内容或注册表值。</para>
+    /// </summary>
+    private void LogMachineSnapshot()
+    {
+        try
+        {
+            Log.LogInfo("[启动快照] platform=" + Application.platform
+                + ", language=" + Application.systemLanguage
+                + ", persistentDataPath=" + Application.persistentDataPath);
+        }
+        catch (Exception e)
+        {
+            Log.LogWarning($"[启动快照] Unity 基本环境读取失败: {e.GetType().Name}: {e.Message}");
+        }
+
+        try
+        {
+            Log.LogInfo("[启动快照] osVersion=" + Environment.OSVersion.Version
+                + ", operatingSystem=" + SystemInfo.operatingSystem
+                + ", processor=" + SystemInfo.processorType
+                + ", graphics=" + SystemInfo.graphicsDeviceName
+                + ", memoryMB=" + SystemInfo.systemMemorySize);
+        }
+        catch (Exception e)
+        {
+            Log.LogWarning($"[启动快照] OS/硬件环境读取失败: {e.GetType().Name}: {e.Message}");
+        }
+
+        try
+        {
+            string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string persistent = Application.persistentDataPath;
+            string localLow = System.IO.Path.Combine(userProfile, "AppData", "LocalLow", "EXNOA LLC_", "ドットアビスX");
+
+            Log.LogInfo("[启动快照] 本地痕迹: "
+                + SnapshotDirectory("%APPDATA%\\dmmgameplayer5", System.IO.Path.Combine(appData, "dmmgameplayer5")) + "; "
+                + SnapshotDirectory("%LOCALAPPDATA%\\dmmgameplayer5-updater", System.IO.Path.Combine(localAppData, "dmmgameplayer5-updater")));
+            Log.LogInfo("[启动快照] 本地身份: "
+                + SnapshotDirectory("在线版", localLow) + "; "
+                + SnapshotDirectory("离线版", System.IO.Path.Combine(userProfile, "AppData", "LocalLow", "EXNOA LLC_", "ドットアビスX_offline")));
+            Log.LogInfo("[启动快照] 配置/注册表: "
+                + SnapshotFile("AbsfRuntimeConfig.dat", System.IO.Path.Combine(persistent, "AbsfRuntimeConfig.dat")) + "; "
+                + SnapshotRegistryKey("HKCU\\Software\\EXNOA LLC."));
+        }
+        catch (Exception e)
+        {
+            Log.LogWarning($"[启动快照] 本地痕迹读取失败: {e.GetType().Name}: {e.Message}");
+        }
+    }
+
+    /// <summary>只检查目录存在性并统计其顶层条目数量,不读取任何条目内容。</summary>
+    private string SnapshotDirectory(string label, string path)
+    {
+        try
+        {
+            bool exists = System.IO.Directory.Exists(path);
+            int count = exists ? System.IO.Directory.GetFileSystemEntries(path).Length : 0;
+            return $"{label}=exists:{exists},topLevel:{count}";
+        }
+        catch (Exception e)
+        {
+            Log.LogWarning($"[启动快照] 目录检查失败({label}): {e.GetType().Name}: {e.Message}");
+            return $"{label}=error";
+        }
+    }
+
+    /// <summary>只检查文件是否存在,不打开或读取文件。</summary>
+    private string SnapshotFile(string label, string path)
+    {
+        try
+        {
+            return $"{label}=exists:{System.IO.File.Exists(path)}";
+        }
+        catch (Exception e)
+        {
+            Log.LogWarning($"[启动快照] 文件检查失败({label}): {e.GetType().Name}: {e.Message}");
+            return $"{label}=error";
+        }
+    }
+
+    /// <summary>只检查 HKCU 下的子键是否存在,不读取任何注册表值。</summary>
+    private string SnapshotRegistryKey(string label)
+    {
+        // 注册表仅在 Windows 上存在;显式判断让平台分析器知道这里受平台保护(插件实际只跑在 Windows)。
+        if (!OperatingSystem.IsWindows())
+            return $"{label}=skip(非 Windows)";
+        try
+        {
+            using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey("Software\\EXNOA LLC."))
+                return $"{label}=exists:{key != null}";
+        }
+        catch (Exception e)
+        {
+            Log.LogWarning($"[启动快照] 注册表键检查失败({label}): {e.GetType().Name}: {e.Message}");
+            return $"{label}=error";
         }
     }
 

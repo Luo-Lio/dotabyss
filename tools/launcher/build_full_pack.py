@@ -238,7 +238,7 @@ def write_local_low_seed(out_dir: str, src: str) -> list:
 
 
 def write_version_and_repo(out_dir: str, version: str, repo: str, src: str,
-                           baseline: str, channel: str) -> dict:
+                           baseline: str, channel: str, notice: str = "") -> dict:
     """写 offline_version.json 与 launcher.json,返回版本元数据。"""
     plugin_version = core.plugin_file_version(src)
     seed_bin, seed_hash = core.seed_catalog_pair(out_dir)
@@ -246,6 +246,7 @@ def write_version_and_repo(out_dir: str, version: str, repo: str, src: str,
         "version": version,
         "baseline": baseline or version,
         "channel": channel or "baseline",
+        "notice": notice or "",
         "plugin_version": plugin_version,
         "plugin_md5": core.file_md5(core.plugin_dll_path(out_dir)),
         "stories_md5": core.file_md5(core.stories_path(out_dir)),
@@ -408,6 +409,7 @@ def main() -> int:
     parser.add_argument("--version", default=time.strftime("%Y%m%d"), help="离线包版本号")
     parser.add_argument("--baseline", default="", help="基线版本号(默认=本包版本;重发保持旧基线)")
     parser.add_argument("--channel", default="baseline", help="更新通道(默认 baseline)")
+    parser.add_argument("--notice", default="", help="玩家公告(写进 offline_version.json,允许换行)")
     parser.add_argument("--catalog-bin", default="", help="手动指定 catalog bin(默认自动取 LocalLow 最近一份)")
     parser.add_argument("--repo", default="", help="GitHub 仓库 owner/name(写入 launcher.json)")
     parser.add_argument("--recopy", action="store_true", help="目标已存在也重抄")
@@ -435,7 +437,7 @@ def main() -> int:
     print("[seed] %s" % ("、".join(extras) if extras else "(无附属种子,可忽略)"))
     repo = args.repo or core.read_github_repo(src)
     data = write_version_and_repo(out_dir, args.version, repo, src,
-                                  args.baseline, args.channel)
+                                  args.baseline, args.channel, args.notice)
     copy_player_files(out_dir)
     print("[gen] 插件 v%s,版本 %s,基线 %s,仓库 %s"
           % (plugin_version or "(未知)", data["version"], data["baseline"], repo or "(未配置)"))
