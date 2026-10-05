@@ -19,7 +19,7 @@
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <DebugType>none</DebugType>
-    <Version>0.7.24</Version>
+    <Version>0.7.25</Version>
     <Product>StoryViewer</Product>
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
     <!-- 复制出来的客户端目录(含 BepInEx\core、BepInEx\interop、BepInEx\unity-libs) -->

@@ -5,18 +5,23 @@ using HarmonyLib;
 namespace StoryViewer.Patches;
 
 /// <summary>
-/// 0.7.22 加入 → 0.7.23 禁用:此 Harmony Finalizer 钩住 AppEngine.OnServiceRegistered
-/// 会干扰 il2cpp async 初始化流,使服务注册读取到 null 数据(本机原本正常的 0.7.19
-/// 在加了此补丁后反而触发 BitConverter.ToBoolean(null) → 剧情执行报错)。
+/// fresh install 兜底:AppEngine.OnServiceRegistered 在未成功联网过的全新安装上会读到 null
+/// 字节 → BitConverter.ToBoolean(null) 抛异常 → InitializeServicesAsync 中断 → 黑屏/卡启动。
+/// 本 Finalizer 抑制这个离线预期内的异常,让引擎初始化继续走完。
 /// <para>
-/// 根因修复已由 DeployRuntimeConfigIfNeeded(嵌入资源释放) 完成,不再需要兜底补丁。
+/// 版本沿革:0.7.22 加入 → 0.7.23 误判禁用 → 0.7.25 重新启用。
+/// 0.7.23 以为“Harmony 钩 il2cpp async 方法有副作用”而禁用,但玩家侧 fresh install
+/// 在 0.7.24(无 guard)下直接重现该崩溃、反而不可用;当初本机那次“回归”实为
+/// caches_update 清单含非法路径导致的更新失败(已独立修复),与本补丁无关。
+/// 本补丁只对**同步 void** 方法加 Finalizer(不碰 __args、不短路、不碰 __result),
+/// 不属“钩 async 状态机”那一类陷阱,安全。
 /// </para>
 /// </summary>
 [HarmonyPatch]
 internal static class EngineBootGuard_OnServiceRegistered
 {
-    /// <summary>0.7.23:永久禁用——Harmony 钩 il2cpp async 方法有副作用。</summary>
-    public static bool Enabled => false;
+    /// <summary>0.7.25:重新启用——fresh install 需要它抑制 OnServiceRegistered 的离线预期崩溃。</summary>
+    public static bool Enabled => true;
 
     [HarmonyTargetMethod]
     private static MethodBase TargetMethod()
