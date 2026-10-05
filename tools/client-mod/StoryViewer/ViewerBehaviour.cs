@@ -57,6 +57,10 @@ public class ViewerBehaviour : MonoBehaviour
 
     /// <summary>是否已按当前屏幕算过一次缩放。</summary>
     private bool _scaleApplied;
+    // 0.7.27:记录上次应用缩放时的屏幕尺寸;窗口放大/全屏切换后据此重算缩放与布局,
+    // 修「游戏窗口变大、剧情面板不跟着变大(仍按首次打开时的小尺寸居中)」的问题。
+    private int _lastScreenW = -1;
+    private int _lastScreenH = -1;
 
     /// <summary>把设计尺寸换算成实际像素(静态方法:类注释禁止实例方法内的本地函数)。</summary>
     private static int S(int design) => Mathf.RoundToInt(design * _uiScale);
@@ -973,6 +977,8 @@ public class ViewerBehaviour : MonoBehaviour
 
         EnsureFonts();
         Safe("样式", EnsureStyles);
+        // 0.7.27:每帧按当前屏幕尺寸校正缩放(尺寸没变时内部直接返回),使面板随窗口变化自适应。
+        Safe("缩放", ApplyUiScale);
         Safe("布局", ComputeLayout);
 
         Safe("遮罩", () => UiKit.Fill(new Rect(0f, 0f, Screen.width, Screen.height),
@@ -1147,14 +1153,19 @@ public class ViewerBehaviour : MonoBehaviour
     /// </summary>
     private void ApplyUiScale()
     {
-        if (_scaleApplied)
+        int screenW = Screen.width;
+        int screenH = Screen.height;
+        // 已应用过且屏幕尺寸没变 → 直接返回;尺寸变了(窗口放大/切全屏)则重算,让面板跟着走。
+        if (_scaleApplied && screenW == _lastScreenW && screenH == _lastScreenH)
             return;
         _scaleApplied = true;
+        _lastScreenW = screenW;
+        _lastScreenH = screenH;
         float manual = Plugin.UiScale.Value;
         _uiScale = manual > 0.01f
             ? Mathf.Clamp(manual, 0.5f, 4f)
             : Mathf.Clamp(
-                Mathf.Min(Screen.height * 0.85f / 700f, Screen.width * 0.93f / 1080f),
+                Mathf.Min(screenH * 0.85f / 700f, screenW * 0.93f / 1080f),
                 1f, 2.6f);
 
         WindowW = S(1080);

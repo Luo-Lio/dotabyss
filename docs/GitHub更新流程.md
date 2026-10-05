@@ -95,14 +95,21 @@
 D:\Python\python.exe tools\launcher\build_full_pack.py --recopy --zip --repo Luo-Lio/dotabyss
 
 # 3. 生成发布附件到 dist\release_<版本>\(素材增量用 --caches-since 指旧包目录)
-D:\Python\python.exe tools\launcher\build_github_pack.py --version 20260925 --notes "新增 XX 剧情"
-D:\Python\python.exe tools\launcher\build_github_pack.py --version 20260925 --notes "新增 XX 剧情" --caches-since "dist\ドットアビスX离线版(旧)"
+D:\Python\python.exe tools\launcher\build_github_pack.py --version 20261008 --notes "基底更新到20261008(插件0.7.27):修复全新机器卡标题、新增离线更新包;老玩家建议重新下载完整包整包重装"
+D:\Python\python.exe tools\launcher\build_github_pack.py --version 20261008 --notes "..." --caches-since "dist\ドットアビスX离线版(旧)"
 
 # 4. 上传(需已登录 gh;标题/说明按需)
-gh release create 20260925 --title "离线包 20260925" --notes "新增 XX 剧情" dist\release_20260925\*
+gh release create 20261008 --title "离线包 20261008" --notes "基底更新到20261008;老玩家建议重新下载完整包" dist\release_20261008\*
+
+# 5. 离线更新包(给连不上 GitHub 的玩家:把同一套 release 资产原样打成一个 zip,从网盘/群等渠道发布)
+D:\Python\python.exe tools\launcher\build_update_pack.py --release-dir dist\release_20261008 --version 20261008
+#   → 产出 dist\ドットアビスX_更新包_20261008.zip(玩家用启动器「高级 ▾ → 离线更新包」本地导入)
 ```
 
 上传后到 Release 页面确认附件都在、名字没被改写。
+
+> 离线更新包与 GitHub Release 是同一次发布的同一套资产(只是 zip 化),内容/基线/各 md5 完全一致;
+> 玩家走哪条通道结果相同。发布时记得两个渠道都放:能上 GitHub 的走「更新」,连不上的走「离线更新包」。
 
 ## 5. 发布前的自测(无需真实网络)
 

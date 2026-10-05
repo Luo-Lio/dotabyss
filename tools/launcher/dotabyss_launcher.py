@@ -19,13 +19,16 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
+import zipfile
 import tkinter as tk
 from tkinter import ttk
+from tkinter import filedialog
 from tkinter import messagebox
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -461,15 +464,18 @@ class App:
             self.adv_frame, "打开日志", self.open_logs, C_BTN, C_BTN_HOVER)
         self.btn_diag = _tk_button(
             self.adv_frame, "收集日志", self.run_diag, C_BTN, C_BTN_HOVER)
+        self.btn_offline = _tk_button(
+            self.adv_frame, "离线更新包", self.run_update_offline, C_BTN, C_BTN_HOVER)
         self.btn_check.pack(side="left")
         self.btn_probe.pack(side="left", padx=8)
         self.btn_repair.pack(side="left")
         self.btn_logs.pack(side="left", padx=8)
         self.btn_diag.pack(side="left")
+        self.btn_offline.pack(side="left", padx=8)
         self._advanced_open = False
         self._btns = [
             self.btn_start, self.btn_update, self.btn_check, self.btn_probe,
-            self.btn_repair, self.btn_logs, self.btn_diag, self.btn_adv,
+            self.btn_repair, self.btn_logs, self.btn_diag, self.btn_offline, self.btn_adv,
         ]
         self.log("游戏目录:%s" % self.game_dir, "dim")
         if self._plugin_version_full:
@@ -1122,21 +1128,27 @@ class App:
         c.save_version(self.game_dir, updated)
         return True
 
-    def _do_update(self):
+    def _do_update(self, parsed=None, remote=None):
         """执行一次 latest 累积更新;任一步异常只打红字。
-
+    
+        两种来源:①在线——自己从 GitHub Release 取 manifest 与资产;
+        ②离线更新包——由调用方预先传入 ``parsed``/``remote``(本地目录清单),
+        同时调用方需已把 ``_http_get``/``_http_download`` 换成本地取数器。
         顺序:修复/身份 → 客户端本体 → bundle 素材 → catalog → 索引 → 封面 →
         插件 DLL → 玩家文档 → 启动器。基线不一致直接拒绝(必须重装完整包)。
         """
-        repo = c.read_github_repo(self.game_dir)
-        if not repo:
-            self._emit("未配置仓库(launcher.json 的 github_repo 为空)", "warn")
-            return
+        offline = parsed is not None and remote is not None
+        if not offline:
+            repo = c.read_github_repo(self.game_dir)
+            if not repo:
+                self._emit("未配置仓库(launcher.json 的 github_repo 为空)", "warn")
+                return
         if c.game_running():
             self._emit("游戏运行中,拒绝更新。", "err")
             return
         try:
-            parsed, remote = self._fetch_remote()
+            if not offline:
+                parsed, remote = self._fetch_remote()
             local = c.load_version(self.game_dir)
             # 基线优先于版本号裁决:基线不一致 = 必须整包重装,即使版本号恰好相同
             if c.baseline_mismatch(local, remote):
@@ -1239,6 +1251,65 @@ class App:
             self._emit("更新失败:%s" % exc, "err")
             if self._auto_out:
                 self._write_auto_result("FAIL")
+
+    def run_update_offline(self):
+        """高级区按钮:选一个「离线更新包 .zip」并应用(全程不联网)。"""
+        if self.busy:
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root, title="选择离线更新包(.zip)",
+            filetypes=[("离线更新包", "*.zip"), ("所有文件", "*.*")])
+        if not path:
+            return
+        self._offline_pack = path
+        self._run_bg(self._do_update_offline)
+
+    def _do_update_offline(self):
+        """把选中的离线更新包解压到临时目录,用本地取数器驱动一次与在线一致的更新。
+
+        更新包就是 GitHub Release 那一整套资产(version.json 清单 + 各资产文件)打成一个 zip;
+        解压后把取数映射到该目录,再走与在线完全相同的 ``_do_update``(含基线校验/md5 校验/回退)。
+        """
+        global _http_get, _http_download
+        zip_path = getattr(self, "_offline_pack", "")
+        if not zip_path or not os.path.isfile(zip_path):
+            self._emit("离线更新包不存在:%s" % zip_path, "err")
+            return
+        if c.game_running():
+            self._emit("游戏运行中,拒绝更新。", "err")
+            return
+        tmp = os.path.join(tempfile.gettempdir(),
+                           "dotabyss_pack_%s" % time.strftime("%Y%m%d_%H%M%S"))
+        try:
+            os.makedirs(tmp, exist_ok=True)
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(tmp)
+        except (OSError, zipfile.BadZipFile) as exc:
+            self._emit("解压更新包失败:%s" % exc, "err")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        root = c.locate_release_pack_dir(tmp)
+        if not root:
+            self._emit("更新包里没有 version.json(不是有效的离线更新包)", "err")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        try:
+            parsed = c.parse_local_release(root)
+            with open(parsed["version_json_url"], "r", encoding="utf-8") as handle:
+                remote = json.load(handle)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._emit("更新包清单无法解析:%s" % exc, "err")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        self._emit("从离线更新包更新:%s(版本 %s)"
+                   % (os.path.basename(root), remote.get("version") or "?"), "dim")
+        get_old, dl_old = _http_get, _http_download
+        try:
+            _http_get, _http_download = make_dir_fetchers(root)
+            self._do_update(parsed=parsed, remote=remote)
+        finally:
+            _http_get, _http_download = get_old, dl_old
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def _smoke_done(self, out_path):
         """冒烟:窗口已起来则写 PASS 并退出,不启动游戏。"""

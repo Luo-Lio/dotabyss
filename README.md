@@ -21,8 +21,8 @@ pwsh -File tools\launcher\freeze_launcher.ps1
 & D:\Python\python.exe tools\launcher\build_full_pack.py --zip
 
 # 构建 GitHub 更新附件(含客户端本体/素材增量/catalog,见 docs\GitHub更新流程.md)
-& D:\Python\python.exe tools\launcher\build_github_pack.py --version 20260925
-& D:\Python\python.exe tools\launcher\build_github_pack.py --version 20260925 --caches-since "dist\旧包目录"
+& D:\Python\python.exe tools\launcher\build_github_pack.py --version 20261008
+& D:\Python\python.exe tools\launcher\build_github_pack.py --version 20261008 --caches-since "dist\旧包目录"
 
 # 启动器/打包脚本的单元测试(106 + 24 + 11 项)
 & D:\Python\python.exe tools\launcher\test_offline_core.py
@@ -30,6 +30,8 @@ pwsh -File tools\launcher\freeze_launcher.ps1
 & D:\Python\python.exe tools\launcher\test_pack_tools.py
 ```
 
+- **当前基底**:完整包 **20261008**(插件 **0.7.27**,基线 baseline `20260924`)——自本版起以其为起点
+  做后续增量与发布;新玩家直接下 `dist\ドットアビスX离线版_20261008.zip`。
 - 离线包要点:身份隔离(`app.info` 产品名 `*_offline`,存档与在线版完全分开)、
   包内 `catalog_seed\`(新机器首启的关键)、`baseline` 基线门禁(基线不符必须重装完整包)、
   更新通道覆盖客户端本体与素材增量。

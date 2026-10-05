@@ -50,7 +50,8 @@ LOCAL_LOW_ENV = "DOTABYSS_LOCAL_LOW_BASE"
 # 插件内置假 API 服务器端口(与 dotabyss.storyviewer.cfg 的 [Offline] ApiPort 一致)。
 API_PORT = 18923
 
-# 离线档要求的配置键:键名 → 期望值(true/false)。缺一不可,否则游戏会连真服务器。
+# 离线档要求的配置键:键名 → 期望值(true/false)。缺一不可,否则离线模式不成立
+# (会连真服务器,或全新机器因 Title 实名/年龄授权缓存为空而卡在标题)。
 OFFLINE_KEYS = (
     ("OfflineAuth", "true"),
     ("OfflineApi", "true"),
@@ -58,6 +59,7 @@ OFFLINE_KEYS = (
     ("ServeCachedBundles", "true"),
     ("SkipRequestEncryption", "true"),
     ("ForceDmmSdkSuccess", "true"),
+    ("BypassTitleAtt", "true"),
     ("CaptureForward", "false"),
 )
 
@@ -1105,6 +1107,44 @@ def parse_latest_release(payload: dict) -> dict:
     return release
 
 
+def locate_release_pack_dir(root: str) -> str:
+    """在离线更新包解压目录里找到含 ``version.json`` 清单的那层目录(可能在子目录)。
+
+    返回含 version.json 的目录;找不到返回空串。(注意:这与本地的 offline_version.json 不同)
+    """
+    if os.path.isfile(os.path.join(root, "version.json")):
+        return root
+    for base, _dirs, names in os.walk(root):
+        if "version.json" in names:
+            return base
+    return ""
+
+
+def parse_local_release(dir_path: str) -> dict:
+    """从本地「离线更新包」目录拼出与在线 ``parse_latest_release`` 等价的 parsed。
+
+    按 ``_ASSET_URL_KEYS`` 的文件名扫目录里存在的文件,值一律为本地绝对路径
+    (启动器的本地取数器只取末段文件名回接目录,故路径形式不影响)。缺 version.json 抛错。
+    """
+    release = {"tag": "", "assets_by_name": {}}
+    for key in _ASSET_URL_KEYS.values():
+        release[key] = None
+    if not os.path.isdir(dir_path):
+        raise ValueError("离线更新包目录不存在:%s" % dir_path)
+    for name in os.listdir(dir_path):
+        path = os.path.join(dir_path, name)
+        if not os.path.isfile(path):
+            continue
+        key = _ASSET_URL_KEYS.get(name)
+        if key:
+            url = path.replace("\\", "/")  # 本地取数器按 "/" 拆末段文件名,统一成正斜杠
+            release[key] = url
+            release["assets_by_name"][name] = url
+    if not release.get("version_json_url"):
+        raise ValueError("离线更新包缺少 version.json")
+    return release
+
+
 def baseline_mismatch(local: dict, remote: dict) -> bool:
     """本地与远端基线是否不一致(不一致必须重装完整包,不接受增量更新)。
 
@@ -1142,11 +1182,29 @@ DIAG_UPLOAD_TOKEN_ENV = "DOTABYSS_DIAG_UPLOAD_TOKEN"
 DIAG_UPLOAD_TIMEOUT = 30
 DIAG_KEEP_HEAD_BYTES = 2 * 1024 * 1024          # 超大日志额外保留开头的字节数(崩溃签名常在开机段)
 DIAG_SIGNATURE_SCAN_BYTES = 16 * 1024 * 1024    # 关键字抽取最多扫描的字节数(有界,防超大日志卡住)
-# 已知黑屏崩溃链签名:原生 Addressables 初始化失败 → aa/runtime.json 回退 → CriSound/BitConverter。
+# 已知黑屏崩溃链签名:原生 Addressables 初始化失败 → aa/runtime.json 回退 → CriSound/BitConverter;
+# 以及 Title 场景的 ATT(实名/年龄授权)崩溃链:OnInitializeImplAsync → ATTPermissionCheck →
+# RequestAuthorizationAsync → BitConverter.ToBoolean(null)。0.7.27 起把 ATT/Title/场景标记纳入,
+# 免得“卡在哪一步”又要翻半天日志。
 DIAG_SIGNATURE_PATTERNS = (
     "runtime.json", "TextDataProvider", "Player Content", "Unable to load runtime",
     "asset is null", "BitConverter", "Value cannot be null", "CriSound",
     "LoadBuiltinSound", "InitializeAsync", "InitializeServicesAsync",
+    "OnServiceRegistered", "ATTPermissionCheck", "RequestAuthorizationAsync",
+    "ATTManager", "OnInitializeImplAsync", "场景切换", "未观察异常",
+    "Title ATT", "异常已抑制", "MBuildings",
+)
+
+# 启动阶段里程碑标记(按在日志里出现的先后推断“走到哪一步/停在哪一步”)。
+DIAG_BOOT_MILESTONES = (
+    ("BepInEx 启动", "BepInEx"),
+    ("插件加载", "StoryViewer 加载完成"),
+    ("引擎初始化", "InitializeServicesAsync"),
+    ("AppEngine 服务注册", "OnServiceRegistered"),
+    ("ATT 授权旁路", "Title ATT"),
+    ("标题 Title 场景", "场景切换到: Title"),
+    ("首页 Home 场景", "场景切换到: Home"),
+    ("剧情 Novel 场景", "场景切换到: Novel"),
 )
 
 
@@ -1261,6 +1319,77 @@ def _offline_api_summary(game_dir: str) -> str:
     return last or "(日志里暂无命中统计)"
 
 
+def _diag_stall_analysis(game_dir: str) -> list:
+    """从主日志推断启动时间线与“疑似卡点”,给出一眼可定位的结论行。
+
+    这是 0.7.27 为终结“找了一天都没找到”而加的:把场景切换、关键标记、
+    最后一次场景切换后的首条未观察异常(含堆栈摘要)浓缩成几行 + 一句结论。
+    """
+    path = os.path.join(logs_dir(game_dir), "LogOutput.log")
+    if not os.path.isfile(path):
+        return ["(无 LogOutput.log:插件可能没起来或日志目录不同)"]
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(min(os.path.getsize(path), 4 * 1024 * 1024))
+    except OSError as error:
+        return ["读取 LogOutput 失败:%s" % error]
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+
+    scene_sw = []  # (行号, 目标场景)
+    for idx, ln in enumerate(lines):
+        if "场景切换" in ln:
+            tail = ln.split("场景切换", 1)[1].lstrip("到: ： ").strip()
+            scene_sw.append((idx, tail or ln.strip()))
+    last_scene = scene_sw[-1][1] if scene_sw else "(无场景切换记录)"
+
+    def has(sub):
+        return any(sub in ln for ln in lines)
+
+    guarded = has("异常已抑制")
+    att_bypass = has("Title ATT")
+    mbuild = has("MBuildings")
+
+    after = scene_sw[-1][0] if scene_sw else 0
+    stall_err = None
+    stall_stack = []
+    for idx in range(after, len(lines)):
+        if "未观察异常" in lines[idx]:
+            stall_err = lines[idx].strip()[:300]
+            j = idx + 1
+            while (j < len(lines) and j < idx + 10 and (lines[j].startswith(" ")
+                   or "at " in lines[j] or "Project" in lines[j] or ".cs" in lines[j])):
+                stall_stack.append(lines[j].strip()[:200])
+                j += 1
+            break
+
+    reached_home = any("Home" in s for _, s in scene_sw)
+    reached_novel = any("Novel" in s for _, s in scene_sw)
+
+    out = []
+    stage_hits = [label for label, tok in DIAG_BOOT_MILESTONES
+                  if any(tok in ln for ln in lines)]
+    out.append("阶段命中:%s" % ("、".join(stage_hits) if stage_hits else "(无)"))
+    out.append("场景切换时间线:%s" % (" → ".join("%s@L%d" % (s, i) for i, s in scene_sw[:12]) or "(无)"))
+    out.append("最后到达场景:%s" % last_scene)
+    out.append("关键标记:AppEngine 抑制=%s / ATT 旁路=%s / MBuildings 提示=%s" % (
+        "是" if guarded else "否", "是" if att_bypass else "否", "是" if mbuild else "否"))
+    if stall_err:
+        out.append("最后场景之后首条未观察异常:%s" % stall_err)
+        out.extend("    " + s for s in stall_stack[:8])
+    if reached_home or reached_novel:
+        verdict = "流程已到达 %s,未见致命卡点(若仍有异常,多为非致命/仅首页外观)。" % (
+            "Home/Novel")
+    elif stall_err:
+        verdict = ("疑似卡点:进入「%s」后出现未观察异常且此后无进一步场景切换 → "
+                   "大概率卡在该场景初始化。对照 0.7.27:若日志里没有「[Title ATT] 离线旁路」,"
+                   "说明该版本尚未旁路 Title ATT(需升到 0.7.27 或把配置 BypassTitleAtt=true)。"
+                   % last_scene)
+    else:
+        verdict = "未见未观察异常,也未到达 Home:可能停在更早阶段或正常待命,请结合上面时间线判断。"
+    out.append(">>> 疑似卡点结论:%s" % verdict)
+    return out
+
+
 def _diag_summary_lines(game_dir: str) -> list:
     """生成诊断摘要文本行(静态环境 + 关键运行时指标 + 自检/探针结果)。"""
     import platform
@@ -1274,6 +1403,14 @@ def _diag_summary_lines(game_dir: str) -> list:
         lines.append("游戏进程:%s" % ("运行中" if game_running() else "未运行"))
     except Exception as error:  # noqa: BLE001
         lines.append("游戏进程:探测失败 %s" % error)
+
+    # 启动时间线与卡点定位放在最前面:接收端无需逐行翻日志就能看出“走到哪、卡在哪”。
+    lines.append("")
+    lines.append("--- 启动时间线与卡点定位 ---")
+    try:
+        lines.extend(_diag_stall_analysis(game_dir))
+    except Exception as error:  # noqa: BLE001
+        lines.append("卡点分析异常:%s" % error)
 
     dll = plugin_dll_path(game_dir)
     try:

@@ -20,7 +20,7 @@ public class Plugin : BasePlugin
     public const string Guid = "dotabyss.storyviewer";
 
     /// <summary>插件版本(必须与 csproj 的 <Version> 保持一致,便于排查与诊断回传)。</summary>
-    public const string Version = "0.7.26";
+    public const string Version = "0.7.27";
 
     /// <summary>共享日志器,供行为组件与播放器使用。</summary>
     internal static ManualLogSource Logger;
@@ -99,6 +99,9 @@ public class Plugin : BasePlugin
 
     /// <summary>离线时跳过剧情前的「数据下载」确认弹窗(资源都在本地,无需下载)。</summary>
     internal static ConfigEntry<bool> SkipNovelDownloadPopup;
+
+    /// <summary>离线时旁路 Title 场景的 ATT(实名/年龄授权)检查:新机器无授权缓存会读 null 崩溃卡在 Title。</summary>
+    internal static ConfigEntry<bool> BypassTitleAtt;
 
     /// <summary>游戏原本的 API 根地址(重定向到本机前的值,抓包转发用它做上游)。</summary>
     internal static string OriginalApiBase;
@@ -185,6 +188,8 @@ public class Plugin : BasePlugin
             "离线模式:跳过游戏错误弹窗(避免非致命错误挡住剧情播放;内容仍写日志)");
         SkipNovelDownloadPopup = Config.Bind("Offline", "SkipNovelDownloadPopup", true,
             "离线模式:跳过剧情前的「数据下载」确认弹窗(资源都在本地,无需下载)");
+        BypassTitleAtt = Config.Bind("Offline", "BypassTitleAtt", true,
+            "离线模式:旁路 Title 场景的 ATT(实名/年龄授权)检查。全新机器没有在线版的授权缓存时,游戏在 Title 会读 null 抛 BitConverter.ToBoolean 崩溃、卡在标题进不了首页;离线不需要 ATT,直接判为已通过");
         ErrorPopupLog = Config.Bind("Debug", "ErrorPopupLog", true,
             "把游戏错误弹窗的内容(errorCode/title/message)写进日志,便于离线排查");
 
