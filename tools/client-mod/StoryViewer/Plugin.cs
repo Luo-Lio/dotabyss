@@ -3,6 +3,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
+using System.Reflection;
 using StoryViewer.Patches;
 using UnityEngine;
 
@@ -18,8 +19,8 @@ public class Plugin : BasePlugin
     /// <summary>插件唯一标识。</summary>
     public const string Guid = "dotabyss.storyviewer";
 
-    /// <summary>插件版本(与 csproj 的 Version 保持一致,便于排查)。</summary>
-    public const string Version = "0.7.22";
+    /// <summary>插件版本(必须与 csproj 的 <Version> 保持一致,便于排查与诊断回传)。</summary>
+    public const string Version = "0.7.24";
 
     /// <summary>共享日志器,供行为组件与播放器使用。</summary>
     internal static ManualLogSource Logger;
@@ -211,6 +212,7 @@ public class Plugin : BasePlugin
         AddComponent<ViewerBehaviour>();
         InstallUnobservedExceptionHook();
         DeployRuntimeConfigIfNeeded();
+        SeedMasterDataIfNeeded();
         if (OfflineApi.Value)
         {
             ApiServer = new OfflineApiServer(OfflineApiPort.Value);
@@ -218,6 +220,20 @@ public class Plugin : BasePlugin
             EnableOfflineMode();
         }
         PatchManager.Install();
+
+        // 版本自检:Plugin.Version 常量必须与程序集版本(csproj <Version>)一致。
+        // 升版本时若只改了 csproj 忘了改这个常量,日志/顶栏/诊断回传的 plugin_version 会错报。
+        try
+        {
+            string asmVer = typeof(Plugin).Assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+                .InformationalVersion ?? "";
+            int plus = asmVer.IndexOf('+');
+            if (plus >= 0) asmVer = asmVer.Substring(0, plus);
+            if (!string.IsNullOrEmpty(asmVer) && asmVer != Version)
+                Log.LogWarning($"[版本自检] Plugin.Version 常量={Version} 与程序集版本={asmVer} 不一致:升版本时忘了同步常量,诊断回传的 plugin_version 会错报!");
+        }
+        catch { /* 自检失败不影响加载 */ }
 
         Log.LogInfo($"StoryViewer {Version} 加载完成:按 {ToggleKey.Value} 打开剧情列表,剧情中按 {SkipKey.Value} 跳到本段结尾");
     }
@@ -314,6 +330,49 @@ public class Plugin : BasePlugin
         catch (Exception e)
         {
             Log.LogWarning($"离线模式:版本信息读取失败: {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 0.7.24:播种主数据磁盘缓存(DownloadCache/*.dat)到 persistentDataPath——只补缺失、绝不覆盖。
+    /// <para>
+    /// Home 场景建建筑列表时 <c>TopScene.CreateBuildingModelListAsync → MasterDataStore.GetCache&lt;MBuildings&gt;()</c>
+    /// 会抛 <c>MBuildings not found</c>:主数据不在 Addressables Caches 也不在通用 API JSON,
+    /// 而是 <c>MasterDataStore</c> 首下写出的 <c>DownloadCache\&lt;hash&gt;.dat</c>。干净安装由启动器/完整包
+    /// 播种 LocalLow;但非启动器安装态(手工拷贝、未走更新)会缺,导致首页主数据缺失。
+    /// 插件目录自带 <c>local_low_seed\DownloadCache</c>,这里在加载早期把它补种到位即可自愈。
+    /// 剧情播放不依赖它(所以缺时也能播),此修复针对首页 UI。
+    /// </para>
+    /// </summary>
+    private void SeedMasterDataIfNeeded()
+    {
+        try
+        {
+            string persistent = UnityEngine.Application.persistentDataPath;
+            string targetDir = System.IO.Path.Combine(persistent, "DownloadCache");
+            string srcDir = System.IO.Path.Combine(Paths.PluginPath, "StoryViewer", "local_low_seed", "DownloadCache");
+            if (!System.IO.Directory.Exists(srcDir))
+            {
+                Log.LogInfo($"[主数据播种] 插件目录无种子({srcDir}),跳过(依赖启动器/完整包播种)");
+                return;
+            }
+            int copied = 0, skipped = 0;
+            foreach (var src in System.IO.Directory.GetFiles(srcDir, "*.dat"))
+            {
+                string dst = System.IO.Path.Combine(targetDir, System.IO.Path.GetFileName(src));
+                if (System.IO.File.Exists(dst)) { skipped++; continue; }
+                System.IO.Directory.CreateDirectory(targetDir);
+                System.IO.File.Copy(src, dst, false);
+                copied++;
+            }
+            if (copied > 0)
+                Log.LogInfo($"[主数据播种] 已补种 {copied} 个 DownloadCache .dat → {targetDir}(跳过已存在 {skipped} 个)");
+            else
+                Log.LogInfo($"[主数据播种] 已就绪(无需补种,本地现有 {skipped} 个)");
+        }
+        catch (Exception e)
+        {
+            Log.LogWarning($"[主数据播种] 失败(不致命,首页建筑可能缺失): {e.Message}");
         }
     }
 
