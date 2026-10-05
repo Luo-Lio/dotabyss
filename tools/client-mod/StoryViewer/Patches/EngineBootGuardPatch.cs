@@ -5,32 +5,28 @@ using HarmonyLib;
 namespace StoryViewer.Patches;
 
 /// <summary>
-/// 0.7.22:抑制 AppEngine.OnServiceRegistered 的非致命崩溃。
+/// 0.7.22 加入 → 0.7.23 禁用:此 Harmony Finalizer 钩住 AppEngine.OnServiceRegistered
+/// 会干扰 il2cpp async 初始化流,使服务注册读取到 null 数据(本机原本正常的 0.7.19
+/// 在加了此补丁后反而触发 BitConverter.ToBoolean(null) → 剧情执行报错)。
 /// <para>
-/// 离线环境下,游戏的服务注册后置逻辑 (OnServiceRegistered) 会读取一个由
-/// 服务器初始化流程填充的配置 byte[]——离线时该数组为 null → BitConverter.ToBoolean(null) 抛
-/// ArgumentNullException → 异常向上传播到 Engine.InitializeServicesAsync → 引擎标记为 Failed →
-/// 后续所有 Addressables.LoadSceneAsync / Absf 场景切换均失败 → 所有剧情黑屏。
+/// 根因修复已由 DeployRuntimeConfigIfNeeded(嵌入资源释放) 完成,不再需要兜底补丁。
 /// </para>
-/// 本补丁用 Finalizer 吞掉此异常,让引擎初始化继续完成。
 /// </summary>
 [HarmonyPatch]
 internal static class EngineBootGuard_OnServiceRegistered
 {
+    /// <summary>0.7.23:永久禁用——Harmony 钩 il2cpp async 方法有副作用。</summary>
+    public static bool Enabled => false;
+
     [HarmonyTargetMethod]
     private static MethodBase TargetMethod()
     {
-        // Project.AppEngine 在 il2cpp interop 的 Project.dll 中;
-        // 用反射查找以防 il2cpp 更新后类型路径变动。
         var t = Type.GetType("Project.AppEngine, Project", throwOnError: false)
              ?? AccessTools.TypeByName("Project.AppEngine");
         if (t == null) return null;
         return AccessTools.Method(t, "OnServiceRegistered");
     }
 
-    /// <summary>
-    /// Harmony Finalizer:若原方法抛出异常,记录日志后返回 null(吞掉)。
-    /// </summary>
     [HarmonyFinalizer]
     private static Exception Finalize(Exception __exception)
     {
@@ -39,7 +35,7 @@ internal static class EngineBootGuard_OnServiceRegistered
             Plugin.Logger.LogWarning(
                 $"[启动容错] AppEngine.OnServiceRegistered 异常已抑制(离线预期): " +
                 $"{__exception.GetType().Name}: {__exception.Message}");
-            return null; // swallow → caller sees success
+            return null;
         }
         return null;
     }
