@@ -8,5 +8,6 @@
 
   <ItemGroup>
     <Compile Include="..\StoryViewer\OfflineUserName.cs" Link="OfflineUserName.cs" />
+    <Compile Include="..\StoryViewer\Patches\NullByteGuardTargets.cs" Link="NullByteGuardTargets.cs" />
   </ItemGroup>
 </Project>

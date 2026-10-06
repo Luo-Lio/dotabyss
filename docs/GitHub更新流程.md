@@ -20,6 +20,9 @@
 - 网络:先直连,失败自动回退系统代理(有系统代理时直连用 20 秒短超时)。
 - **基线(baseline)优先**:`离线包 offline_version.json` 的 `baseline` 与 Release 的不一致时,
   启动器直接拒绝并提示「需重装」——即使版本号巧合相同。
+- **本体(`GameAssembly.dll`)更新是最大风险面**:它同时换掉 IL2CPP interop(旧插件可能整体失效)
+  与游戏侧的开机初始化/授权链路(2026-10-05 的 Win10 黑屏就是这么来的)。本体更新后必须
+  **按新 interop 重编译插件 + 在 Windows 10 上验收**,清单见 `日常更新流程.md` §7。
 
 ## 2. 每个 Release 的附件(名字必须完全一致)
 
@@ -111,6 +114,9 @@ D:\Python\python.exe tools\launcher\build_update_pack.py --release-dir dist\rele
 > 离线更新包与 GitHub Release 是同一次发布的同一套资产(只是 zip 化),内容/基线/各 md5 完全一致;
 > 玩家走哪条通道结果相同。发布时记得两个渠道都放:能上 GitHub 的走「更新」,连不上的走「离线更新包」。
 
+> **⚠️ 当前有一批改动「已就绪、尚未发布」**(插件 0.7.29 + 启动器内建诊断端点,2026-10-06 完成):
+> 发布时按 **§8** 执行;那台机器的 dev 包在发布前**不要点「更新」**,原因见 §8 末尾的窗口期提示。
+
 ## 5. 发布前的自测(无需真实网络)
 
 启动器带离线演练口(`docs\离线版实现说明_开发者必读.md` §4):
@@ -150,3 +156,35 @@ DotabyssOfflineLauncher.exe --game-dir <旧包目录> --release-dir <发布目�
   `caches_update.zip` 一般几十 MB;**若单次素材增量超过 2 GB**,说明该走新完整包而不是增量。
 - 完整包 zip 约 8 GB,**超过 GitHub Release 单附件上限**,走网盘/其他渠道分发;
   更新通道附件正常发 GitHub Release。
+
+## 8. 待发布(已就绪,尚未发布)
+
+> 记录于 2026-10-06。**这批改动已完成、只差发布**;发布完成后本节可整段删除。
+
+- **插件 0.7.29**(源码已建、已部署到 `client\`):`BitConverter` 空字节兜底从 3 个重载扩到全部
+  10 个「从字节数组读一个值」的重载;按 interop 实际暴露的重载安装(缺失的走"目标缺失跳过",
+  不会误报安装失败);新增启动自检行 `[空字节兜底] BitConverter 保护已安装: N/10 目标`
+  (详情见 `离线版实现说明_开发者必读.md` §2.4)。已验证:构建 0 警告 0 错误、插件单元测试 2 组全绿。
+- **启动器已内建诊断端点**(重冻结完成):`client\DotabyssOfflineLauncher.exe`,md5
+  `E5C0BCC65D872AA04FF1B1E0EB6229DD`,冒烟 `PASS`;端点常量已用 PyInstaller 归档 API 验证确实在
+  exe 的 PYZ 内、且与生成值完全一致。端点值只存服务器(`/etc/dotabyss-diag.env`),构建时经 env
+  注入;生成物 `tools/launcher/dotabyss_diag_default.py` 已 gitignore、不进 Git。
+  **发布后老玩家只更新启动器即可自动回传诊断包**(此前 `ENDPOINT_B64` 为空,只能人工收包)。
+- **下一个版本号 = 发布当天的 `YYYYMMDD`,必须大于 `20261009`**(同号不同内容会让"已是最新"判断出错)。
+
+发布时要做的事(流程见 §4;资产取自 `client\`,不要另找副本):
+
+1. `pwsh -File tools\client-mod\build.ps1`(插件 0.7.29)→ 再确认
+   `client\DotabyssOfflineLauncher.exe` 仍是内建端点那一版(比对上面的 md5);
+2. 生成 `dist\release_<版本>\`(插件 DLL;`version.json` 的 `launcher_md5` 用上面那个 md5);
+3. `gh release create <版本> … dist\release_<版本>\*`,并确认置为 Latest;
+4. `build_update_pack.py --release-dir dist\release_<版本> --version <版本>` 出离线更新包;
+5. `version.json` 的 `notice` 写清本次内容 + 老玩家引导(旧基座 0925 建议重装 1008);
+6. 更新 `docs\离线版实现说明_开发者必读.md` 顶部的"当前发布"块,并删除本节。
+
+> **⚠️ 窗口期注意(发布前)**:本机 dev 包的启动器已经**比线上 20261009 新**。此时若运行
+> `client\DotabyssOfflineLauncher.exe` 并点「更新」,程序会判定"版本号相同但本地产物未完全就绪"
+> (`dotabyss_launcher.py:1280-1288`),进而走修复流程,把刚烘进端点的启动器**换回线上旧版**。
+> 若被换回:重设 `DOTABYSS_DIAG_UPLOAD_URL` / `DOTABYSS_DIAG_UPLOAD_TOKEN`(值在服务器
+> `/etc/dotabyss-diag.env`)后重跑 `pwsh -File tools\launcher\freeze_launcher.ps1` 即可恢复(约 1 分钟)。
+> 发布之后版本一致,该窗口自动关闭。

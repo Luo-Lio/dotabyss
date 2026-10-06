@@ -41,8 +41,12 @@ internal static class PatchManager
                 Plugin.Logger.LogError($"补丁 {type.Name} 安装失败: {e.Message}");
             }
         }
+        // 「跳过」现在有两种来源:按配置关闭、或目标重载在当前 interop 里不存在
+        // (后者见 NullByteGuardResolver:不存在的重载必须跳过而不是走进安装失败分支)。
         Plugin.Logger.LogInfo($"Harmony 补丁安装完成: {ok} 个" +
-            (skipped > 0 ? $"(按配置跳过 {skipped} 个)" : ""));
+            (skipped > 0 ? $"(按配置或目标缺失跳过 {skipped} 个)" : ""));
+        // 放在安装报告处,便于一眼看出兜底覆盖情况。
+        NullByteGuardResolver.LogSummary();
     }
 
     /// <summary>

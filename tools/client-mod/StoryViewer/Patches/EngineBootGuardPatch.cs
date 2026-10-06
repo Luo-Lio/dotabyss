@@ -5,7 +5,7 @@ using HarmonyLib;
 namespace StoryViewer.Patches;
 
 /// <summary>
-/// fresh install 兜底:AppEngine.OnServiceRegistered 在未成功联网过的全新安装上会读到 null
+/// fresh install 兜底:AppEngine.OnServiceRegistered 在 <b>Windows 10</b> 上会读到 null
 /// 字节 → BitConverter.ToBoolean(null) 抛异常 → InitializeServicesAsync 中断 → 黑屏/卡启动。
 /// 本 Finalizer 抑制这个离线预期内的异常,让引擎初始化继续走完。
 /// <para>

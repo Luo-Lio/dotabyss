@@ -20,7 +20,7 @@ public class Plugin : BasePlugin
     public const string Guid = "dotabyss.storyviewer";
 
     /// <summary>插件版本(必须与 csproj 的 <Version> 保持一致,便于排查与诊断回传)。</summary>
-    public const string Version = "0.7.28";
+    public const string Version = "0.7.29";
 
     /// <summary>共享日志器,供行为组件与播放器使用。</summary>
     internal static ManualLogSource Logger;

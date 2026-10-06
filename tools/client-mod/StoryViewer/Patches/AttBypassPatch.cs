@@ -12,14 +12,15 @@ namespace StoryViewer.Patches;
 /// 流程走到 Title 场景后又撞同族第二处崩溃——
 /// <c>TopScene.OnInitializeImplAsync → ATTPermissionCheck → ATTManager.RequestAuthorizationAsync
 /// → BitConverter.ToBoolean(null)</c>,异常经 UniTask 异步链被捕获成「未观察异常」,
-/// Title 初始化停住、进不了 Home。开发机能过是因为早年装过在线版、机器侧早有那份授权缓存;
-/// 新机器没有 → 读 null → 崩。这正是「脱离原版依赖」没做到位的根因。
+/// Title 初始化停住、进不了 Home。触发条件落在 <b>Windows 10</b>(不是「机器侧有授权缓存」):
+/// 15 份玩家诊断包中 11 份 Windows 10 全部命中该 null 崩溃、4 份 Windows 11 全部不命中;
+/// 一台从未装过在线版的干净 Windows 11 虚拟机同样正常。
 /// </para>
 /// <para>
 /// 修复方式:ATT 是 DMM 的实名/年龄授权门(代码语义在 Windows 本应「直接过」)。
 /// 直接把 <c>TopScene.ATTPermissionCheck</c>(返回 <see cref="UniTask"/>)短路成
 /// 一个**已完成**的 UniTask,不让它去 await <c>RequestAuthorizationAsync</c>,
-/// 于是既不读那份不存在的缓存、OnInitializeImplAsync 也能继续走到 Home。
+/// 于是不再走 ATT 授权流程、OnInitializeImplAsync 也能继续走到 Home。
 /// 这与已验证可用的 <see cref="Dmm_PlatformInitBypass"/> 用的是同一套「置 __result=已完成的 UniTask」手法,
 /// 不碰 async 状态机本身,风险最低。
 /// </para>
