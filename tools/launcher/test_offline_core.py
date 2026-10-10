@@ -75,6 +75,22 @@ class ParseLatestReleaseTest(unittest.TestCase):
         parsed = core.parse_latest_release(payload)
         self.assertIsNone(parsed["stories_url"])
 
+    def test_release_from_cdn_base_builds_same_shape(self):
+        """CDN 直链应为每个固定附件生成与 API 解析结果相同的键。"""
+        parsed = core.release_from_cdn_base(
+            "https://github.com/example/repo/releases/latest/download/")
+        self.assertIsNone(parsed["tag"])
+        self.assertEqual(set(parsed["assets_by_name"]), set(core._ASSET_URL_KEYS))
+        for name, key in core._ASSET_URL_KEYS.items():
+            expected = "https://github.com/example/repo/releases/latest/download/%s" % name
+            self.assertEqual(parsed[key], expected)
+            self.assertEqual(parsed["assets_by_name"][name], expected)
+
+    def test_release_from_cdn_base_rejects_empty_base(self):
+        """空 CDN 基址不能生成看似有效的附件地址。"""
+        with self.assertRaises(ValueError):
+            core.release_from_cdn_base("/")
+
 
 class FileNeedsUpdateTest(unittest.TestCase):
     """file_needs_update:空期望/缺文件/相同/不同。"""
@@ -190,8 +206,7 @@ class LauncherReplaceCmdTest(unittest.TestCase):
             handle.write(b"old-launcher")
         with open(exe + ".new", "wb") as handle:
             handle.write(b"new-launcher")
-        script = core.build_launcher_replace_cmd(game_dir).replace("-n 3", "-n 2")
-        script = script.replace('start "" "%s"' % exe, "rem skip-start")
+        script = core.build_launcher_replace_cmd(game_dir).replace("-n 4", "-n 2")
         subprocess.Popen(script, shell=True, cwd=game_dir, close_fds=True,
                          creationflags=0x00000008 | 0x00000200)
         deadline = time.time() + 15

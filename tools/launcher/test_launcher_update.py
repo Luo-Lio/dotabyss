@@ -132,9 +132,15 @@ class UpdateFlowTest(unittest.TestCase):
     def _fake_http(self, release, remote, url_bytes=None):
         """返回可注入 ``_http_get`` 的假实现。"""
         mapping = {
-            "https://api.github.com/repos/test/repo/releases/latest":
-                json.dumps(release).encode("utf-8"),
+            "https://github.com/test/repo/releases/latest/download/version.json":
+                json.dumps(remote).encode("utf-8"),
             "http://x/version.json": json.dumps(remote).encode("utf-8"),
+            "https://github.com/test/repo/releases/latest/download/StoryViewer.dll": self.NEW_DLL,
+            "https://github.com/test/repo/releases/latest/download/stories.json": self.NEW_STORIES,
+            "https://github.com/test/repo/releases/latest/download/previews.zip": self.PREVIEWS_ZIP,
+            "https://github.com/test/repo/releases/latest/download/player_docs.zip": self.DOCS_ZIP,
+            "https://github.com/test/repo/releases/latest/download/%s" % core.LAUNCHER_EXE_NAME:
+                self.NEW_LAUNCHER,
             "http://x/StoryViewer.dll": self.NEW_DLL,
             "http://x/stories.json": self.NEW_STORIES,
             "http://x/previews.zip": self.PREVIEWS_ZIP,
@@ -175,6 +181,25 @@ class UpdateFlowTest(unittest.TestCase):
         self._make_app()
         self.app._do_update()
         self.assertIn("未配置仓库", self._drain())
+
+    def test_fetch_remote_uses_github_cdn_without_api_request(self):
+        """版本检查只请求 releases/latest/download/version.json,不访问 REST API。"""
+        self._set_repo()
+        self._make_app()
+        remote = self._remote_version(version="20260925")
+        requested = []
+
+        def fetch(url, timeout=60):  # noqa: ARG001 - 接口兼容
+            requested.append(url)
+            if url.endswith("/version.json"):
+                return json.dumps(remote).encode("utf-8")
+            raise AssertionError("不应请求 GitHub API:%s" % url)
+
+        with mock.patch.object(launcher, "_http_get", fetch):
+            _parsed, fetched = self.app._fetch_remote()
+        self.assertEqual(fetched, remote)
+        self.assertEqual(requested, [
+            "https://github.com/test/repo/releases/latest/download/version.json"])
 
     def test_game_running_refuses(self):
         self._set_repo()
@@ -526,9 +551,18 @@ class ChannelUpdateFlowTest(unittest.TestCase):
     def _fake_http(self, release, remote):
         """构造 (get, download) 假实现。"""
         mapping = {
-            "https://api.github.com/repos/test/repo/releases/latest":
-                json.dumps(release).encode("utf-8"),
+            "https://github.com/test/repo/releases/latest/download/version.json":
+                json.dumps(remote).encode("utf-8"),
             "http://x/version.json": json.dumps(remote).encode("utf-8"),
+            "https://github.com/test/repo/releases/latest/download/StoryViewer.dll": self.NEW_DLL,
+            "https://github.com/test/repo/releases/latest/download/stories.json": self.NEW_STORIES,
+            "https://github.com/test/repo/releases/latest/download/%s" % core.LAUNCHER_EXE_NAME:
+                b"old-launcher",
+            "https://github.com/test/repo/releases/latest/download/client_body.zip": self._client_body_zip(),
+            "https://github.com/test/repo/releases/latest/download/caches_update.zip": self._caches_zip(),
+            "https://github.com/test/repo/releases/latest/download/master_data.zip": self._master_data_zip(),
+            "https://github.com/test/repo/releases/latest/download/catalog_1.bin": self.NEW_CATALOG,
+            "https://github.com/test/repo/releases/latest/download/catalog_1.bin.hash": self.NEW_CATALOG_HASH.encode("utf-8"),
             "http://x/StoryViewer.dll": self.NEW_DLL,
             "http://x/stories.json": self.NEW_STORIES,
             "http://x/launcher.exe": b"old-launcher",
@@ -545,11 +579,13 @@ class ChannelUpdateFlowTest(unittest.TestCase):
                 raise AssertionError("意外请求:%s" % url)
             return mapping[url]
 
-        def download(url, dest, timeout=600, chunk=1 << 20):
+        def download(url, dest, timeout=600, chunk=1 << 20, on_progress=None):
             """把预置内容写到目标文件。"""
             data = get(url, timeout)
             with open(dest, "wb") as handle:
                 handle.write(data)
+            if on_progress:
+                on_progress(len(data), len(data))
             return len(data)
 
         return get, download
@@ -582,14 +618,14 @@ class ChannelUpdateFlowTest(unittest.TestCase):
 
         def counted_get(url, timeout=60):
             """记录非 version.json 的资产 GET。"""
-            if url.startswith("http://x/") and url != "http://x/version.json":
+            if not url.endswith("/version.json"):
                 calls.append(url)
             return get(url, timeout)
 
-        def counted_download(url, dest, timeout=600, chunk=1 << 20):
+        def counted_download(url, dest, timeout=600, chunk=1 << 20, on_progress=None):
             """记录 zip 资产下载。"""
             calls.append(url)
-            return download(url, dest, timeout, chunk)
+            return download(url, dest, timeout, chunk, on_progress)
 
         with mock.patch.object(launcher, "_http_get", counted_get), \
                 mock.patch.object(launcher, "_http_download", counted_download):
@@ -665,7 +701,10 @@ class ChannelUpdateFlowTest(unittest.TestCase):
         release = self._release()
         release["assets"] = [asset for asset in release["assets"]
                              if asset["name"] != "master_data.zip"]
-        logs = self._run_update(release, self._remote())
+        # CDN 直链本身不提供资产列表;用旧 API 解析结果模拟缺附件的发布。
+        with mock.patch.object(core, "release_from_cdn_base",
+                               lambda _base: core.parse_latest_release(release)):
+            logs = self._run_update(release, self._remote())
         self.assertIn("主数据附件", logs)
         self.assertEqual(core.load_version(self.game)["version"], "20250101")
 
@@ -686,7 +725,8 @@ class ChannelUpdateFlowTest(unittest.TestCase):
         logs, calls = self._run_update_with_asset_calls(release, remote)
 
         self.assertIn("主数据", logs)
-        self.assertIn("http://x/master_data.zip", calls)
+        self.assertIn(
+            "https://github.com/test/repo/releases/latest/download/master_data.zip", calls)
         self.assertTrue(os.path.isfile(seed_file))
 
     def test_same_version_with_matching_declared_outputs_does_not_download(self):
@@ -744,7 +784,10 @@ class ChannelUpdateFlowTest(unittest.TestCase):
         self._set_repo()
         self._make_app()
         remote = self._remote(client_body={}, caches_added={})
-        logs = self._run_update(self._release(include_catalog=False), remote)
+        release = self._release(include_catalog=False)
+        with mock.patch.object(core, "release_from_cdn_base",
+                               lambda _base: core.parse_latest_release(release)):
+            logs = self._run_update(release, remote)
         self.assertIn("更新失败", logs)
         self.assertIn("catalog", logs)
         self.assertEqual(core.load_version(self.game)["version"], "20250101")
@@ -910,6 +953,111 @@ class DirFetcherTest(unittest.TestCase):
         self.assertEqual(download("http://x/client_body.zip", dest), 9)
         with open(dest, "rb") as handle:
             self.assertEqual(handle.read(), b"zip-bytes")
+
+
+class StreamDownloadProgressTest(unittest.TestCase):
+    """_stream_to_file:按 Content-Length 报告确定/不确定下载进度。"""
+
+    class _Response:
+        """提供 urllib 响应最小接口的测试响应。"""
+
+        def __init__(self, data, content_length=None):
+            self._data = io.BytesIO(data)
+            self.headers = {} if content_length is None else {
+                "Content-Length": str(content_length)}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size):
+            return self._data.read(size)
+
+    def test_reports_known_total(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dest = os.path.join(temp, "download.bin")
+            progress = []
+            response = self._Response(b"abcdef", content_length=6)
+            self.assertEqual(
+                launcher._stream_to_file(
+                    response, dest, 2,
+                    lambda done, total: progress.append((done, total))), 6)
+            self.assertEqual(progress, [(2, 6), (4, 6), (6, 6)])
+            with open(dest, "rb") as handle:
+                self.assertEqual(handle.read(), b"abcdef")
+
+    def test_reports_unknown_total_without_fake_percentage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dest = os.path.join(temp, "download.bin")
+            progress = []
+            response = self._Response(b"abc", content_length=None)
+            self.assertEqual(
+                launcher._stream_to_file(response, dest, 2,
+                                         lambda done, total: progress.append((done, total))), 3)
+            self.assertEqual(progress, [(2, None), (3, None)])
+
+
+class ProgressQueueTest(unittest.TestCase):
+    """下载进度必须通过队列到达主线程控件,不能由后台线程碰 Tk。"""
+
+    def test_download_callback_uses_queue(self):
+        app = launcher.App.__new__(launcher.App)
+        app.q = launcher.queue.Queue()
+        app._on_download_progress(4, 8)
+        self.assertEqual(app.q.get_nowait(), ("__PROGRESS__", 4, 8))
+
+    def test_known_and_unknown_progress_update_differently(self):
+        app = launcher.App.__new__(launcher.App)
+        app.progress_bar = mock.MagicMock()
+        app.progress_label = mock.MagicMock()
+        app._progress_indeterminate = False
+
+        app._update_progress(4, 8)
+        app.progress_bar.configure.assert_called_with(mode="determinate", value=50.0)
+        app.progress_label.configure.assert_called_with(
+            text="下载进度：50% (4 B/8 B)")
+
+        app.progress_bar.reset_mock()
+        app.progress_label.reset_mock()
+        app._update_progress(4, None)
+        app.progress_bar.configure.assert_called_with(mode="indeterminate", value=0)
+        app.progress_bar.start.assert_called_once_with(10)
+        app.progress_label.configure.assert_called_with(text="下载中：已下载 4 B")
+
+
+class LauncherRestartNoticeTest(unittest.TestCase):
+    """启动期待替换提示:可见、会重试且失败写入游戏根日志。"""
+
+    def test_pending_notice_spawns_and_stays_visible_briefly(self):
+        root = mock.MagicMock()
+        label = mock.MagicMock()
+        with mock.patch.object(launcher.tk, "Tk", return_value=root), \
+                mock.patch.object(launcher.tk, "Label", return_value=label), \
+                mock.patch.object(launcher, "_spawn_launcher_replace") as spawn:
+            launcher._show_pending_launcher_notice("C:/game")
+        spawn.assert_called_once_with("C:/game")
+        root.after.assert_called_once_with(launcher.RESTART_NOTICE_MS, root.destroy)
+        root.mainloop.assert_called_once_with()
+        label.pack.assert_called_once_with(fill="both", expand=True)
+
+    def test_pending_notice_logs_spawn_failure_and_shows_error(self):
+        with tempfile.TemporaryDirectory() as game:
+            root = mock.MagicMock()
+            label = mock.MagicMock()
+            with mock.patch.object(launcher.tk, "Tk", return_value=root), \
+                    mock.patch.object(launcher.tk, "Label", return_value=label), \
+                    mock.patch.object(launcher, "_spawn_launcher_replace",
+                                      side_effect=RuntimeError("spawn denied")):
+                launcher._show_pending_launcher_notice(game)
+            error_path = os.path.join(game, "launcher-error.log")
+            with open(error_path, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("启动期替换任务启动失败", text)
+            self.assertIn("spawn denied", text)
+            label.configure.assert_called_once()
+            root.after.assert_called_once_with(5000, root.destroy)
 
 
 if __name__ == "__main__":

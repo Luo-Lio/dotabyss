@@ -42,32 +42,24 @@ internal static class NullByteGuardTargetsTests
     private static readonly (string Name, NullByteKind Kind)[] Canonical =
     {
         ("ToBoolean", NullByteKind.Boolean),
-        ("ToChar", NullByteKind.Char),
         ("ToInt16", NullByteKind.Int16),
         ("ToInt32", NullByteKind.Int32),
-        ("ToInt64", NullByteKind.Int64),
-        ("ToUInt16", NullByteKind.UInt16),
-        ("ToUInt32", NullByteKind.UInt32),
-        ("ToUInt64", NullByteKind.UInt64),
-        ("ToSingle", NullByteKind.Single),
-        ("ToDouble", NullByteKind.Double),
     };
 
-    /// <summary>运行表结构、枚举覆盖、CLR 类型、默认值转型、崩溃族与未知枚举值的断言。</summary>
+    /// <summary>运行表结构、枚举覆盖、CLR 类型、默认值转型与未知枚举值的断言。</summary>
     internal static void Run()
     {
         AssertTableShape();
         AssertClrTypesAndDefaults();
-        AssertCoreKinds();
         AssertUnknownKindThrows();
 
         Console.WriteLine("NullByteGuardTargets tests passed.");
     }
 
-    /// <summary>断言目标表恰好 10 项、方法名无重复、每个枚举值恰好出现一次、名字与 Kind 配对不对。</summary>
+    /// <summary>断言目标表恰好 3 项、方法名无重复、每个枚举值恰好出现一次、名字与 Kind 配对正确。</summary>
     private static void AssertTableShape()
     {
-        AssertEqual(10, NullByteGuardTargets.All.Count, "兜底目标表必须恰好覆盖 10 个字节数组读取重载");
+        AssertEqual(3, NullByteGuardTargets.All.Count, "兜底目标表必须恰好覆盖 3 个已知崩溃族重载");
 
         var names = new List<string>();
         var kinds = new List<NullByteKind>();
@@ -121,44 +113,23 @@ internal static class NullByteGuardTargetsTests
         var expectedTypes = new Dictionary<NullByteKind, Type>
         {
             [NullByteKind.Boolean] = typeof(bool),
-            [NullByteKind.Char] = typeof(char),
             [NullByteKind.Int16] = typeof(short),
             [NullByteKind.Int32] = typeof(int),
-            [NullByteKind.Int64] = typeof(long),
-            [NullByteKind.UInt16] = typeof(ushort),
-            [NullByteKind.UInt32] = typeof(uint),
-            [NullByteKind.UInt64] = typeof(ulong),
-            [NullByteKind.Single] = typeof(float),
-            [NullByteKind.Double] = typeof(double),
         };
 
         var expectedDefaults = new Dictionary<NullByteKind, object>
         {
             [NullByteKind.Boolean] = false,
-            [NullByteKind.Char] = '\0',
             [NullByteKind.Int16] = (short)0,
             [NullByteKind.Int32] = 0,
-            [NullByteKind.Int64] = 0L,
-            [NullByteKind.UInt16] = (ushort)0,
-            [NullByteKind.UInt32] = 0u,
-            [NullByteKind.UInt64] = 0UL,
-            [NullByteKind.Single] = 0f,
-            [NullByteKind.Double] = 0d,
         };
 
         // 真的做一次 (T)转型：装箱类型与声明类型不一致的错误只会在现场炸，必须在这里挡住。
         var castChecks = new Dictionary<NullByteKind, Func<object, bool>>
         {
             [NullByteKind.Boolean] = value => (bool)value == false,
-            [NullByteKind.Char] = value => (char)value == '\0',
             [NullByteKind.Int16] = value => (short)value == 0,
             [NullByteKind.Int32] = value => (int)value == 0,
-            [NullByteKind.Int64] = value => (long)value == 0,
-            [NullByteKind.UInt16] = value => (ushort)value == 0,
-            [NullByteKind.UInt32] = value => (uint)value == 0,
-            [NullByteKind.UInt64] = value => (ulong)value == 0,
-            [NullByteKind.Single] = value => (float)value == 0f,
-            [NullByteKind.Double] = value => (double)value == 0d,
         };
 
         foreach (NullByteKind kind in Enum.GetValues<NullByteKind>())
@@ -178,19 +149,6 @@ internal static class NullByteGuardTargetsTests
         }
     }
 
-    /// <summary>断言 IsCore 只对已知崩溃族 Boolean / Int16 / Int32 返回 true。</summary>
-    private static void AssertCoreKinds()
-    {
-        foreach (NullByteKind kind in Enum.GetValues<NullByteKind>())
-        {
-            bool expected = kind is NullByteKind.Boolean or NullByteKind.Int16 or NullByteKind.Int32;
-            AssertEqual(
-                expected,
-                NullByteGuardTargets.IsCore(kind),
-                $"IsCore({kind}) 必须为 {expected}（仅 Boolean/Int16/Int32 是已知崩溃族）");
-        }
-    }
-
     /// <summary>断言未知枚举值不会被静默当成合法值，必须抛 ArgumentOutOfRangeException。</summary>
     private static void AssertUnknownKindThrows()
     {
@@ -201,9 +159,6 @@ internal static class NullByteGuardTargetsTests
         AssertThrowsArgumentOutOfRange(
             () => NullByteGuardTargets.DefaultOf(unknown),
             "(NullByteKind)999 传给 DefaultOf 必须抛 ArgumentOutOfRangeException");
-        AssertThrowsArgumentOutOfRange(
-            () => NullByteGuardTargets.IsCore(unknown),
-            "(NullByteKind)999 传给 IsCore 必须抛 ArgumentOutOfRangeException");
     }
 
     /// <summary>比较期望值与实际值（装箱比较），失败时抛出可读断言异常。</summary>

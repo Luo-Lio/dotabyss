@@ -611,16 +611,30 @@ def build_launcher_replace_cmd(game_dir: str) -> str:
     """
     exe = launcher_path(game_dir)
     new = exe + ".new"
-    # 先等 ~3s 让本进程退出;move 最多重试 3 次(间隔 ~1s),避免因 exe 短暂
-    # 被占用而 move 失败(那会导致需手动重启才完成)。start 无论如何都执行;
-    # 若三次都失败,下次启动的 pending_launcher_swap 仍会用 .new 兜底完成。
+    error = os.path.join(game_dir, "launcher-error.log")
+    move_error = error + ".replace.tmp"
+    # 先等本进程退出,再按条件轮询文件锁。旧版只重试三次且无条件 start:
+    # 如果 Python/Tk 或杀毒软件让 exe 多占用几秒,move 失败后 start 的仍是旧文件,
+    # cmd 随即退出且没有任何留痕,正是“窗口关了但不重开”的根因。
     return (
-        'ping 127.0.0.1 -n 4 >nul '
-        '& (move /Y "%(new)s" "%(exe)s" '
-        '|| (ping 127.0.0.1 -n 2 >nul & move /Y "%(new)s" "%(exe)s") '
-        '|| (ping 127.0.0.1 -n 2 >nul & move /Y "%(new)s" "%(exe)s")) '
-        '& start "" "%(exe)s"'
-    ) % {"new": new, "exe": exe}
+        'chcp 65001 >nul & ping 127.0.0.1 -n 4 >nul '
+        '& del /q "%(move_error)s" >nul 2>&1 '
+        '& for /L %%i in (1,1,60) do @if exist "%(new)s" '
+        '(move /Y "%(new)s" "%(exe)s" >nul 2>&1 '
+        '|| ping 127.0.0.1 -n 2 >nul) '
+        '& if not exist "%(new)s" '
+        '(start "" "%(exe)s" >nul 2>&1 '
+        '|| echo [launcher-replace] 启动器启动失败:%(exe)s>>"%(error)s") '
+        'else '
+        '(move /Y "%(new)s" "%(exe)s" > "%(move_error)s" 2>&1 '
+        '&& if not exist "%(new)s" '
+        '(del /q "%(move_error)s" >nul 2>&1 '
+        '& start "" "%(exe)s" >nul 2>&1 '
+        '|| echo [launcher-replace] 启动器启动失败:%(exe)s>>"%(error)s") '
+        'else (echo [launcher-replace] 启动器替换失败:等待文件解锁超时>>"%(error)s" '
+        '& type "%(move_error)s" >>"%(error)s" 2>nul '
+        '& del /q "%(move_error)s" >nul 2>&1))'
+    ) % {"new": new, "exe": exe, "error": error, "move_error": move_error}
 
 
 def extract_zip_bytes(data: bytes, dest_dir: str, allowed_names=None) -> int:
@@ -1127,6 +1141,26 @@ def parse_latest_release(payload: dict) -> dict:
         key = _ASSET_URL_KEYS.get(name)
         if key:
             release[key] = url
+    return release
+
+
+def release_from_cdn_base(base_url: str) -> dict:
+    """从 GitHub ``releases/latest/download`` 基址生成更新附件表。
+
+    GitHub CDN 直链不返回 Release tag,因此 ``tag`` 为 ``None``;其余结构与
+    :func:`parse_latest_release` 完全一致。调用方应传入正式版的
+    ``https://github.com/<repo>/releases/latest/download`` 基址。
+    ``latest`` 不包含 prerelease 或 draft,本项目发布均为正式版,这是有意的边界。
+    空基址抛 ``ValueError``。
+    """
+    base = str(base_url or "").rstrip("/")
+    if not base:
+        raise ValueError("CDN 基址不能为空")
+    release = {"tag": None, "assets_by_name": {}}
+    for name, key in _ASSET_URL_KEYS.items():
+        url = "%s/%s" % (base, name)
+        release[key] = url
+        release["assets_by_name"][name] = url
     return release
 
 

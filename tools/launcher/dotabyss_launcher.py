@@ -58,6 +58,7 @@ FONT_LOG = ("Consolas", 9)
 GITHUB_UA = "dotabyss-offline-launcher"
 ICO_NAME = "dotabyss_launcher.ico"
 ADV_BUTTON_GAP = 8
+RESTART_NOTICE_MS = 800
 
 
 def resolve_icon_path(frozen, meipass, script_dir, exe_dir=None):
@@ -152,8 +153,26 @@ def _proxy_opener(proxies):
     return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
 
 
-def _stream_to_file(response, dest, chunk):
-    """把响应流式写入文件,返回写入字节数;失败时抛出。"""
+def _response_content_length(response):
+    """读取响应的 Content-Length;缺失、非法或负数时返回 ``None``。"""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = headers.get("Content-Length")
+        total = int(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return total if total >= 0 else None
+
+
+def _stream_to_file(response, dest, chunk, on_progress=None):
+    """把响应流式写入文件并可选报告进度,返回写入字节数;失败时抛出。
+
+    ``on_progress`` 接收 ``(已下载字节数, 总字节数或 None)``;响应没有合法
+    ``Content-Length`` 时总字节数为 ``None``,调用方不得据此显示虚假的百分比。
+    """
+    total_size = _response_content_length(response)
     total = 0
     with response, open(dest, "wb") as out:
         while True:
@@ -162,6 +181,8 @@ def _stream_to_file(response, dest, chunk):
                 break
             out.write(block)
             total += len(block)
+            if on_progress:
+                on_progress(total, total_size)
     return total
 
 
@@ -186,16 +207,17 @@ def _http_get(url, timeout=60):
             return response.read()
 
 
-def _http_download(url, dest, timeout=600, chunk=1 << 20):
+def _http_download(url, dest, timeout=600, chunk=1 << 20, on_progress=None):
     """流式下载到文件:先直连,失败自动回退系统代理,返回写入字节数。
 
     回退时以 ``wb`` 重新打开目标文件(截断重写),不会残留半截文件。
+    ``on_progress`` 接收 ``(已下载字节数, 总字节数或 None)``。
     """
     proxies = _proxy_map()
     direct_timeout = min(timeout, 20) if proxies else timeout
     try:
         response = _http_request(_direct_opener(), url, direct_timeout)
-        return _stream_to_file(response, dest, chunk)
+        return _stream_to_file(response, dest, chunk, on_progress)
     except urllib.error.HTTPError:
         raise
     except Exception as exc:
@@ -203,7 +225,7 @@ def _http_download(url, dest, timeout=600, chunk=1 << 20):
             raise
         _note("直连失败(%s),改用系统代理重试…" % exc)
         response = _http_request(_proxy_opener(proxies), url, timeout)
-        return _stream_to_file(response, dest, chunk)
+        return _stream_to_file(response, dest, chunk, on_progress)
 
 
 def make_dir_fetchers(release_dir):
@@ -225,12 +247,16 @@ def make_dir_fetchers(release_dir):
         with open(path, "rb") as handle:
             return handle.read()
 
-    def download(url, dest, timeout=600, chunk=1 << 20):  # noqa: ARG001 - 接口兼容
+    def download(url, dest, timeout=600, chunk=1 << 20,
+                 on_progress=None):  # noqa: ARG001 - 接口兼容
         path = _resolve(url)
         if not os.path.isfile(path):
             raise urllib.error.HTTPError(url, 404, "release dir missing", None, None)
         shutil.copy2(path, dest)
-        return os.path.getsize(dest)
+        size = os.path.getsize(dest)
+        if on_progress:
+            on_progress(size, size)
+        return size
 
     return get, download
 
@@ -255,6 +281,15 @@ _DETACHED = 0x00000008
 _NEW_GROUP = 0x00000200
 
 
+def _append_launcher_error(game_dir, text):
+    """把启动器替换/启动失败原因追加到游戏根 ``launcher-error.log``。"""
+    try:
+        with open(os.path.join(game_dir, "launcher-error.log"), "a", encoding="utf-8") as handle:
+            handle.write("\n=== %s ===\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+    except OSError:
+        pass
+
+
 def _spawn_launcher_replace(game_dir):
     """分离启动 cmd:等本进程退出后 move exe 并拉起新启动器。
 
@@ -269,6 +304,41 @@ def _spawn_launcher_replace(game_dir):
         close_fds=True,
         creationflags=_DETACHED | _NEW_GROUP,
     )
+
+
+def _show_pending_launcher_notice(game_dir):
+    """启动期发现 ``.new`` 时显示状态并安排一次替换重启。
+
+    旧实现直接 spawn 后 ``return``;玩家只能看到窗口消失,无法知道正在重试。
+    这里让状态窗至少停留一小段时间;spawn 失败时保留错误文案并写诊断日志。
+    """
+    try:
+        root = tk.Tk()
+        root.title("ドットアビスX 离线启动器")
+        root.geometry("440x130")
+        root.resizable(False, False)
+        root.configure(bg=C_BG)
+        label = tk.Label(
+            root, text="正在完成启动器更新,即将重启…", bg=C_BG, fg=C_FG,
+            font=FONT, padx=24, pady=28)
+        label.pack(fill="both", expand=True)
+        root.update_idletasks()
+    except Exception as exc:  # noqa: BLE001 - 无 Tk 时仍须留下失败原因
+        _append_launcher_error(game_dir, "启动期更新提示窗口创建失败:%s" % exc)
+        try:
+            _spawn_launcher_replace(game_dir)
+        except Exception as spawn_exc:  # noqa: BLE001
+            _append_launcher_error(game_dir, "启动期替换任务启动失败:%s" % spawn_exc)
+        return
+
+    try:
+        _spawn_launcher_replace(game_dir)
+        root.after(RESTART_NOTICE_MS, root.destroy)
+    except Exception as exc:  # noqa: BLE001 - 显示给玩家并落盘
+        label.configure(text="启动器更新失败,请查看 launcher-error.log 后重试。")
+        _append_launcher_error(game_dir, "启动期替换任务启动失败:%s" % exc)
+        root.after(5000, root.destroy)
+    root.mainloop()
 
 
 def _tk_button(parent, text, command, bg, hover, fg=C_FG, font=FONT, padx=18, pady=8):
@@ -350,6 +420,22 @@ def short_plugin_version(text):
     return value
 
 
+def _format_bytes(value):
+    """把字节数格式化为适合进度标签的短文本。"""
+    if value is None:
+        return "未知"
+    value = max(int(value), 0)
+    units = ("B", "KB", "MB", "GB", "TB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return "%d B" % value
+            return "%.1f %s" % (amount, unit)
+        amount /= 1024
+    return "%d B" % value
+
+
 class App:
     """离线启动器主窗口。"""
 
@@ -379,6 +465,7 @@ class App:
         self._adv_buttons = []
         self._adv_layout_pending = False
         self._offline_hint_logged = False
+        self._progress_indeterminate = False
         root.title("ドットアビスX 离线启动器")
         root.geometry("520x420")
         root.minsize(480, 360)
@@ -455,6 +542,17 @@ class App:
         self.btn_update = _tk_button(
             cta, "更新", self.run_update, C_BTN, C_BTN_HOVER, padx=18, pady=12)
         self.btn_update.pack(side="left", padx=(10, 0))
+
+        progress_frame = tk.Frame(self.root, bg=C_BG)
+        progress_frame.pack(fill="x", padx=16, pady=(0, 8))
+        self.progress_label = tk.Label(
+            progress_frame, text="下载进度：—", bg=C_BG, fg=C_DIM,
+            font=FONT, anchor="w")
+        self.progress_label.pack(fill="x")
+        self.progress_bar = ttk.Progressbar(
+            progress_frame, orient="horizontal", mode="determinate", maximum=100,
+            value=0)
+        self.progress_bar.pack(fill="x", pady=(3, 0))
 
         log_frame = tk.Frame(self.root, bg=C_PANEL)
         self.log_frame = log_frame
@@ -613,6 +711,35 @@ class App:
         self.txt.see("end")
         self.txt.configure(state="disabled")
 
+    def _update_progress(self, done, total):
+        """在主线程更新下载进度条和标签;总大小未知时显示不确定态。"""
+        if done is None:
+            if self._progress_indeterminate:
+                self.progress_bar.stop()
+                self._progress_indeterminate = False
+            self.progress_bar.configure(mode="determinate", value=0)
+            self.progress_label.configure(text="下载进度：—")
+            return
+        if total is not None and total > 0:
+            if self._progress_indeterminate:
+                self.progress_bar.stop()
+                self._progress_indeterminate = False
+            percent = min(max(done * 100.0 / total, 0), 100)
+            self.progress_bar.configure(mode="determinate", value=percent)
+            self.progress_label.configure(
+                text="下载进度：%d%% (%s/%s)" % (
+                    int(percent), _format_bytes(done), _format_bytes(total)))
+            return
+        if not self._progress_indeterminate:
+            self.progress_bar.configure(mode="indeterminate", value=0)
+            self.progress_bar.start(10)
+            self._progress_indeterminate = True
+        self.progress_label.configure(text="下载中：已下载 %s" % _format_bytes(done))
+
+    def _on_download_progress(self, done, total):
+        """后台下载回调:只经队列把进度交给 Tk 主线程。"""
+        self.q.put(("__PROGRESS__", done, total))
+
     def _poll_queue(self):
         """把后台日志与控件指令刷到界面(仅主线程)。"""
         count = 0
@@ -635,6 +762,15 @@ class App:
                 continue
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__NOTICE__":
                 self._refresh_notice()
+                count += 1
+                continue
+            if isinstance(item, tuple) and len(item) == 3 and item[0] == "__PROGRESS__":
+                self._update_progress(item[1], item[2])
+                count += 1
+                continue
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__RESTART__":
+                self._update_progress(None, None)
+                self.root.after(RESTART_NOTICE_MS, self._close_window)
                 count += 1
                 continue
             if isinstance(item, tuple) and len(item) == 2:
@@ -814,13 +950,16 @@ class App:
         self._run_bg(self._do_update)
 
     def _fetch_remote(self):
-        """取 latest Release 与 version.json;未配置仓库或缺少文件时抛异常。"""
+        """经 GitHub CDN 取 latest 正式版的 version.json。
+
+        版本检查不再访问 GitHub REST API,因此不消耗匿名 API 配额。``latest``
+        不包含 prerelease/draft;本项目发布均为正式版。
+        """
         repo = c.read_github_repo(self.game_dir)
         if not repo:
             raise RuntimeError("未配置仓库(launcher.json 的 github_repo 为空)")
-        payload = json.loads(_http_get(
-            "https://api.github.com/repos/%s/releases/latest" % repo))
-        parsed = c.parse_latest_release(payload)
+        base = "https://github.com/%s/releases/latest/download" % repo
+        parsed = c.release_from_cdn_base(base)
         if not parsed.get("version_json_url"):
             raise RuntimeError("Release 没有 version.json")
         remote = json.loads(_http_get(parsed["version_json_url"]))
@@ -900,7 +1039,8 @@ class App:
         self._emit("客户端本体需更新 %d/%d 个文件,开始下载…" % (len(todo), len(files)), "dim")
         zip_path = self._temp_zip("client_body")
         try:
-            got = _http_download(url, zip_path, timeout=3600)
+            got = _http_download(url, zip_path, timeout=3600,
+                                 on_progress=self._on_download_progress)
             expected = str(body.get("zip_md5") or "")
             if expected and c.file_md5(zip_path) != expected.lower():
                 raise RuntimeError("client_body.zip 摘要不符(下载 %d 字节)" % got)
@@ -929,7 +1069,8 @@ class App:
         self._emit("素材缓存需补充 %d/%d 个 bundle,开始下载…" % (len(todo), len(files)), "dim")
         zip_path = self._temp_zip("caches")
         try:
-            got = _http_download(url, zip_path, timeout=3600)
+            got = _http_download(url, zip_path, timeout=3600,
+                                 on_progress=self._on_download_progress)
             expected = str(data.get("zip_md5") or "")
             if expected and c.file_md5(zip_path) != expected.lower():
                 raise RuntimeError("caches_update.zip 摘要不符(下载 %d 字节)" % got)
@@ -979,7 +1120,8 @@ class App:
             self._emit("主数据缓存需更新 %d 个文件,开始下载…" % len(files), "dim")
             zip_path = self._temp_zip("master_data")
             try:
-                got = _http_download(url, zip_path, timeout=600)
+                got = _http_download(url, zip_path, timeout=600,
+                                     on_progress=self._on_download_progress)
                 expected_zip = str(remote.get("master_data_md5") or "")
                 if expected_zip and c.file_md5(zip_path) != expected_zip.lower():
                     raise RuntimeError("master_data.zip 摘要不符(下载 %d 字节)" % got)
@@ -1039,6 +1181,10 @@ class App:
         """
         url = release.get("player_docs_url")
         expected = str(remote.get("player_docs_zip_md5") or "")
+        # CDN 直链表会为所有固定附件生成 URL;没有 version.json 摘要时,
+        # 说明该旧 Release 没声明文档包,不能仅凭固定 URL 把它当成必选附件。
+        if not expected:
+            return ""
         stored = str((local or {}).get("player_docs_zip_md5") or "")
         if expected and stored.lower() == expected.lower():
             return ""
@@ -1058,6 +1204,9 @@ class App:
         """从 Release 更新封面包(previews.zip 覆盖到预览目录)。"""
         url = release.get("previews_zip_url")
         expected = str(remote.get("previews_zip_md5") or "")
+        # 同上:固定 CDN URL 不代表每个历史 Release 都实际声明该可选包。
+        if not expected:
+            return ""
         stored = str((local or {}).get("previews_zip_md5") or "")
         if expected and stored.lower() == expected.lower():
             return ""
@@ -1363,16 +1512,23 @@ class App:
             })
             c.save_version(self.game_dir, new_version)
             self.q.put(("__NOTICE__", None))
+            self.q.put(("__PROGRESS__", None, None))
             self._emit("更新完成。", "ok")
             if restart:
                 self._emit("正在重启启动器…", "ok")
                 self._write_auto_result("OK-RESTART")
-                _spawn_launcher_replace(self.game_dir)
-                self._close_window()
+                try:
+                    _spawn_launcher_replace(self.game_dir)
+                except Exception as exc:
+                    _append_launcher_error(self.game_dir, "启动器替换任务启动失败:%s" % exc)
+                    raise
+                # 给主线程一个可见的“正在重启”状态,避免日志刚入队就被 destroy 掉。
+                self.q.put(("__RESTART__", None))
                 return
             self._write_auto_result("OK version=%s" % new_version.get("version"))
             self._set_button_text("已是最新")
         except Exception as exc:
+            self.q.put(("__PROGRESS__", None, None))
             self._emit("更新失败:%s" % exc, "err")
             if self._auto_out:
                 self._write_auto_result("FAIL")
@@ -1479,7 +1635,7 @@ def main(argv=None):
         _http_get, _http_download = make_dir_fetchers(release_dir)
     game_dir = game_dir or resolve_game_dir()
     if (not smoke_out) and getattr(sys, "frozen", False) and c.pending_launcher_swap(game_dir):
-        _spawn_launcher_replace(game_dir)
+        _show_pending_launcher_notice(game_dir)
         return 0
     root = tk.Tk()
     app = App(root, smoke_out=smoke_out, game_dir=game_dir, auto_out=auto_out)
@@ -1490,11 +1646,7 @@ def main(argv=None):
             text = "".join(traceback.format_exception(etype, value, tb))
         except Exception:  # noqa: BLE001 - 格式化失败也不能让日志本身抛错
             text = repr(value)
-        try:
-            with open(os.path.join(game_dir, "launcher-error.log"), "a", encoding="utf-8") as fh:
-                fh.write("\n=== %s ===\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
-        except OSError:
-            pass
+        _append_launcher_error(game_dir, text)
 
     root.report_callback_exception = _log_exc
     if auto_out:
