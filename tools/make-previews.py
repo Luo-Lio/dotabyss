@@ -34,7 +34,7 @@ from PIL import Image, ImageDraw, ImageFont
 # ---------------------------------------------------------------- 路径与常量
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)  # 项目根 E:\agent\dmm\dotabyss
+ROOT = os.path.dirname(HERE)  # 项目根(仓库根)
 OUTPUT = os.path.join(ROOT, "output")
 STORIES_JSON = os.path.join(HERE, "client-mod", "StoryViewer", "stories.json")
 PREVIEW_DIR = os.path.join(ROOT, "client", "BepInEx", "plugins", "StoryViewer", "previews")

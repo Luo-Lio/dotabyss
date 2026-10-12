@@ -138,7 +138,7 @@ DotabyssOfflineLauncher.exe --game-dir <旧包目录> --release-dir <发布目�
    `client_body → caches_added → master_data → catalog → stories → previews → DLL → 文档 → 启动器`;
 2. 再跑一次:输出 `OK-UPTODATE`;
 3. 把发布目录的 `baseline` 改掉再跑:`BLOCKED-BASELINE`,且包内版本文件不变;
-4. 检查 `.new` 是否被替换、`app.info` 是否仍是 `*_offline`、`_Data\Caches` 是否新增了 bundle。
+4. 检查 `.new` 是否被替换、`app.info` 是否仍为**原版** `ドットアビスX`(无 `_offline` 后缀)、`_Data\Caches` 是否新增了 bundle。
 
 ## 6. 回滚
 

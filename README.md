@@ -17,14 +17,14 @@
 # 冻结启动器到 client\(PyInstaller onefile + 冒烟自检)
 pwsh -File tools\launcher\freeze_launcher.ps1
 
-# 构建完整包(排除开发产物 + 校验 + 离线身份 + catalog 种子;--zip 出压缩包;--repo owner/name 写更新仓库)
+# 构建完整包(排除开发产物 + 校验 + app.info 保持原版 + catalog 种子;--zip 出压缩包;--repo owner/name 写更新仓库)
 & D:\Python\python.exe tools\launcher\build_full_pack.py --zip
 
 # 构建 GitHub 更新附件(含客户端本体/素材增量/catalog,见 docs\GitHub更新流程.md)
 & D:\Python\python.exe tools\launcher\build_github_pack.py --version 20261008
 & D:\Python\python.exe tools\launcher\build_github_pack.py --version 20261008 --caches-since "dist\旧包目录"
 
-# 启动器/打包脚本的单元测试(106 + 24 + 11 项)
+# 启动器/打包脚本的单元测试(141 + 43 + 14 项)
 & D:\Python\python.exe tools\launcher\test_offline_core.py
 & D:\Python\python.exe tools\launcher\test_launcher_update.py
 & D:\Python\python.exe tools\launcher\test_pack_tools.py
@@ -32,9 +32,14 @@ pwsh -File tools\launcher\freeze_launcher.ps1
 
 - **当前基底**:完整包 **20261008**(插件 **0.7.27**,基线 baseline `20260924`)——自本版起以其为起点
   做后续增量与发布;新玩家直接下 `dist\ドットアビスX离线版_20261008.zip`。
-- 离线包要点:身份隔离(`app.info` 产品名 `*_offline`,存档与在线版完全分开)、
-  包内 `catalog_seed\`(新机器首启的关键)、`baseline` 基线门禁(基线不符必须重装完整包)、
+- 离线包要点:包内 `catalog_seed\`(新机器首启的关键)、`baseline` 基线门禁(基线不符必须重装完整包)、
   更新通道覆盖客户端本体与素材增量。
+  ⚠️ **2026-10-11 实测更正**:原先宣称的「身份隔离(`app.info` 产品名 `*_offline`,存档与在线版
+  完全分开)」**不成立** —— `app.info` 改名不影响 Unity 的 `persistentDataPath` 与 PlayerPrefs
+  注册表根,离线包与在线版**共用同一份存档/设置**。**已按方案 C 处理**:不再改 `app.info`
+  (旧残留会还原),目录一律按真实身份推导,并在启动/修复前对共享设置做**健康检查与隔离**
+  (不可解密的明文设置值 → 备份后删除)。详见
+  [`docs/离线版实现说明_开发者必读.md`](docs/离线版实现说明_开发者必读.md) §2.1、§2.5。
 - 开发者文档:[`docs/离线版实现说明_开发者必读.md`](docs/离线版实现说明_开发者必读.md)、
   [`docs/GitHub更新流程.md`](docs/GitHub更新流程.md)、
   [`docs/日常更新流程.md`](docs/日常更新流程.md)(游戏更新后"同步→打包→发布"的逐步操作手册)。

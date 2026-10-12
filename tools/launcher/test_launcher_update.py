@@ -50,6 +50,14 @@ class UpdateFlowTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.game = self.tmp.name
+        # 隔离真实注册表与 LocalLow:safe_repair 会做存档健康检查,不能碰开发机的真实存档
+        self._old_store = os.environ.get(core.PREFS_STORE_ENV)
+        self._old_base = os.environ.get(core.LOCAL_LOW_ENV)
+        store = os.path.join(self.game, "_prefs.json")
+        with open(store, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        os.environ[core.PREFS_STORE_ENV] = store
+        os.environ[core.LOCAL_LOW_ENV] = os.path.join(self.game, "_locallow")
         self._make_game_dir()
         self.root = None
         self.app = None
@@ -60,6 +68,12 @@ class UpdateFlowTest(unittest.TestCase):
                 self.root.destroy()
             except Exception:
                 pass
+        for name, old in ((core.PREFS_STORE_ENV, self._old_store),
+                          (core.LOCAL_LOW_ENV, self._old_base)):
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
         self.tmp.cleanup()
 
     # ------------------------------------------------------------ 夹具

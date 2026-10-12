@@ -843,10 +843,9 @@ class App:
             self._emit("首次准备结束,仍有未通过项,可点「修复」。", "warn")
 
     def _ensure_local_ready(self):
-        """启动游戏前补齐本地条件(幂等、不联网):离线身份 + catalog/附属种子。"""
-        identity = c.ensure_offline_identity(self.game_dir)
-        if "已就绪" not in identity:
-            self.log(identity, "warn")
+        """启动游戏前补齐本地条件(幂等、不联网):存档健康 + catalog/附属种子。"""
+        for line in c.repair_prefs_store(self.game_dir):
+            self.log(line, "warn" if ("隔离" in line or "中止" in line) else "dim")
         for line in c.seed_catalog_to_local_low(self.game_dir):
             if "已就绪" in line:
                 continue
@@ -1025,7 +1024,7 @@ class App:
         return message + ";" + "、".join(lines)
 
     def _apply_client_body(self, release, remote, stamp):
-        """按清单更新客户端本体(插件/缓存/身份/启动器除外)。返回说明或空串。"""
+        """按清单更新客户端本体(插件/缓存/app.info/启动器除外)。返回说明或空串。"""
         body = remote.get("client_body") or {}
         files = body.get("files") or {}
         if not files:
@@ -1404,7 +1403,7 @@ class App:
         两种来源:①在线——自己从 GitHub Release 取 manifest 与资产;
         ②离线更新包——由调用方预先传入 ``parsed``/``remote``(本地目录清单),
         同时调用方需已把 ``_http_get``/``_http_download`` 换成本地取数器。
-        顺序:修复/身份 → 客户端本体 → bundle 素材 → catalog → 索引 → 封面 →
+        顺序:修复 → 客户端本体 → bundle 素材 → catalog → 索引 → 封面 →
         插件 DLL → 玩家文档 → 启动器。基线不一致直接拒绝(必须重装完整包)。
         """
         offline = parsed is not None and remote is not None

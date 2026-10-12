@@ -5,6 +5,7 @@
 运行:``D:\\Python\\python.exe test_offline_core.py``(标准库 unittest)。
 """
 
+import base64
 import hashlib
 import io
 import json
@@ -254,6 +255,247 @@ class VersionFileTest(unittest.TestCase):
         first["version"] = "mutated"
         second = core.load_version(self.tmp.name)
         self.assertEqual(second["version"], "")
+
+
+class PrefsStoreTest(unittest.TestCase):
+    """存档值分类与健康检查:密文/明文/异类三态与边界。
+
+    用 ``PREFS_STORE_ENV`` 指向 JSON 假存储,不碰真实注册表。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old_env = os.environ.get(core.PREFS_STORE_ENV)
+        self.store_path = os.path.join(self.tmp.name, "store.json")
+        os.environ[core.PREFS_STORE_ENV] = self.store_path
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop(core.PREFS_STORE_ENV, None)
+        else:
+            os.environ[core.PREFS_STORE_ENV] = self._old_env
+        self.tmp.cleanup()
+
+    def _write_store(self, mapping):
+        """把 ``{键名: bytes}`` 写成假存储(十六进制)。"""
+        with open(self.store_path, "w", encoding="utf-8") as handle:
+            json.dump({name: value.hex() for name, value in mapping.items()}, handle)
+
+    def test_cipher_needs_base64_multiple_of_16(self):
+        """合法密文:base64 解码后长度为 16 的倍数。"""
+        self.assertEqual(core.classify_prefs_value("64", base64.b64encode(bytes(16))), "cipher")
+        self.assertEqual(core.classify_prefs_value("64", base64.b64encode(bytes(32))), "cipher")
+
+    def test_plain_short_base64_is_flagged(self):
+        """实测的明文形态(1 字节 bool / 4 字节 float)必须判为待隔离。"""
+        self.assertEqual(core.classify_prefs_value("64", b"AQ=="), "plain")
+        self.assertEqual(core.classify_prefs_value("64", b"AAAAPw=="), "plain")
+
+    def test_empty_and_non_base64_are_plain(self):
+        """空值与非 base64 内容同样解不开,判为待隔离。"""
+        self.assertEqual(core.classify_prefs_value("64", b""), "plain")
+        self.assertEqual(core.classify_prefs_value("64", b"\x00"), "plain")
+        self.assertEqual(core.classify_prefs_value("64", b"not base64!!"), "plain")
+
+    def test_trailing_nul_is_stripped(self):
+        """注册表值带尾随 NUL,剥掉后仍应识别为密文。"""
+        data = base64.b64encode(bytes(16)) + b"\x00"
+        self.assertEqual(core.classify_prefs_value("64", data), "cipher")
+
+    def test_unity_keys_are_skipped(self):
+        """Unity 自己的键(即使值是明文)一律不碰。"""
+        self.assertEqual(
+            core.classify_prefs_value("unity.player_session_count_h1", b"AQ=="), "skip")
+
+    def test_non_bytes_are_skipped(self):
+        """REG_DWORD / REG_SZ 等非字节值一律跳过,不得误删。"""
+        self.assertEqual(core.classify_prefs_value("64", 12345), "skip")
+        self.assertEqual(core.classify_prefs_value("64", None), "skip")
+        self.assertEqual(core.classify_prefs_value("64", "AQ=="), "skip")
+
+    def test_health_flags_plain_names(self):
+        """健康检查列出待隔离键名,并给出比例。"""
+        self._write_store({"a1": base64.b64encode(bytes(16)),
+                           "b2": b"AQ==",
+                           "unity.x": b"AQ=="})
+        ok, detail, plain = core.prefs_store_health()
+        self.assertFalse(ok)
+        self.assertEqual(plain, ["b2"])
+        self.assertIn("1/3", detail)
+
+    def test_health_ok_when_all_cipher(self):
+        """全部是合法密文时判健康。"""
+        self._write_store({"a1": base64.b64encode(bytes(16))})
+        ok, _detail, plain = core.prefs_store_health()
+        self.assertTrue(ok)
+        self.assertEqual(plain, [])
+
+    def test_health_ok_when_store_empty(self):
+        """键不存在/为空不算故障(游戏首次运行会自行建立)。"""
+        self._write_store({})
+        ok, detail, plain = core.prefs_store_health()
+        self.assertTrue(ok)
+        self.assertEqual(plain, [])
+        self.assertIn("尚未创建", detail)
+
+    def test_health_reports_unreadable_store(self):
+        """假存储损坏时必须如实报告不可读,而不是当成健康。"""
+        os.environ[core.PREFS_STORE_ENV] = os.path.join(self.tmp.name, "missing.json")
+        ok, detail, plain = core.prefs_store_health()
+        self.assertFalse(ok)
+        self.assertEqual(plain, [])
+        self.assertIn("假存储不可读", detail)
+
+
+class PrefsRepairTest(unittest.TestCase):
+    """repair_prefs_store:先备份再删除、只删明文、失败中止、幂等。
+
+    全部用注入的存储字典,不碰真实注册表。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.game = self.tmp.name
+        self._old_base = os.environ.get(core.LOCAL_LOW_ENV)
+        os.environ[core.LOCAL_LOW_ENV] = os.path.join(self.game, "_locallow")
+
+    def tearDown(self):
+        if self._old_base is None:
+            os.environ.pop(core.LOCAL_LOW_ENV, None)
+        else:
+            os.environ[core.LOCAL_LOW_ENV] = self._old_base
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _cipher():
+        """构造一个长度合法(16 的倍数)的密文值。"""
+        return base64.b64encode(bytes(16))
+
+    def _backup_files(self):
+        """返回备份目录下的备份文件名列表。"""
+        folder = os.path.join(self.game, "BepInEx")
+        if not os.path.isdir(folder):
+            return []
+        return [name for name in os.listdir(folder)
+                if name.startswith(core.PREFS_BACKUP_PREFIX)]
+
+    def test_repair_backs_up_and_deletes_plain_only(self):
+        """只删解不开的值;密文与 Unity 的键必须原样保留。"""
+        store = {"a1": self._cipher(), "b2": b"AQ==", "c3": b"AAAAPw==",
+                 "unity.x": b"AQ=="}
+        lines = core.repair_prefs_store(self.game, store)
+        self.assertEqual(sorted(store), ["a1", "unity.x"])
+        self.assertIn("已隔离 2 个", " ".join(lines))
+        backups = self._backup_files()
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(self.game, "BepInEx", backups[0]), encoding="utf-8") as handle:
+            data = json.load(handle)
+        self.assertEqual(sorted(data["deleted"]), ["b2", "c3"])
+        self.assertEqual(bytes.fromhex(data["deleted"]["b2"]), b"AQ==")
+
+    def test_repair_is_idempotent(self):
+        """再跑一次没有待隔离项,不做任何改动。"""
+        store = {"b2": b"AQ=="}
+        core.repair_prefs_store(self.game, store)
+        lines = core.repair_prefs_store(self.game, store)
+        self.assertEqual(store, {})
+        self.assertIn("无需修复", " ".join(lines))
+
+    def test_repair_aborts_when_backup_unwritable(self):
+        """备份写不进时必须中止,一个值都不删。"""
+        store = {"b2": b"AQ=="}
+        with open(os.path.join(self.game, "BepInEx"), "w", encoding="utf-8") as handle:
+            handle.write("占位:让备份目录不可写")
+        lines = core.repair_prefs_store(self.game, store)
+        self.assertEqual(store, {"b2": b"AQ=="})
+        self.assertIn("中止", " ".join(lines))
+
+    def test_repair_skips_when_store_unreadable(self):
+        """读不到存档时如实跳过,不报成成功。"""
+        os.environ[core.PREFS_STORE_ENV] = os.path.join(self.game, "missing.json")
+        try:
+            lines = core.repair_prefs_store(self.game)
+        finally:
+            os.environ.pop(core.PREFS_STORE_ENV, None)
+        self.assertIn("跳过", " ".join(lines))
+
+
+class SafeRepairFirstReadyTest(unittest.TestCase):
+    """safe_repair 的 first_ready 落地:缺失→占位、存在→补齐、已就绪→不动。
+
+    对应 issue #1 的现象:版本文件缺失时 first_ready 写不进去,导致每次启动
+    都重跑首次准备并反复报「offline_version.json 缺失」。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.game = self.tmp.name
+        # 隔离真实 LocalLow 与真实注册表:本组用例只碰临时目录
+        self._old_base = os.environ.get(core.LOCAL_LOW_ENV)
+        os.environ[core.LOCAL_LOW_ENV] = os.path.join(self.game, "_locallow")
+        self._old_store = os.environ.get(core.PREFS_STORE_ENV)
+        store = os.path.join(self.game, "_prefs.json")
+        with open(store, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        os.environ[core.PREFS_STORE_ENV] = store
+
+    def tearDown(self):
+        if self._old_base is None:
+            os.environ.pop(core.LOCAL_LOW_ENV, None)
+        else:
+            os.environ[core.LOCAL_LOW_ENV] = self._old_base
+        if self._old_store is None:
+            os.environ.pop(core.PREFS_STORE_ENV, None)
+        else:
+            os.environ[core.PREFS_STORE_ENV] = self._old_store
+        self.tmp.cleanup()
+
+    def test_missing_version_writes_placeholder_and_first_ready(self):
+        """版本文件缺失时写占位并落 first_ready(否则每次启动都重跑首次准备)。"""
+        core.safe_repair(self.game)
+        data = core.load_version(self.game)
+        self.assertTrue(data["first_ready"])
+        self.assertTrue(data["placeholder"])
+
+    def test_second_repair_does_not_rewrite_version_file(self):
+        """已是 first_ready 时不再改写版本文件(幂等)。"""
+        core.safe_repair(self.game)
+        path = core.version_path(self.game)
+        with open(path, "rb") as handle:
+            before = handle.read()
+        core.safe_repair(self.game)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_existing_version_is_not_marked_placeholder(self):
+        """版本文件存在时只补 first_ready,不写占位标记,且保留原字段。"""
+        core.save_version(self.game, {"version": "20260925"})
+        core.safe_repair(self.game)
+        data = core.load_version(self.game)
+        self.assertTrue(data["first_ready"])
+        self.assertFalse(data.get("placeholder"))
+        self.assertEqual(data["version"], "20260925")
+
+    def test_safe_repair_does_not_rename_app_info(self):
+        """修复流程不再改 app.info(旧版「身份隔离」实测无效,见 docs §2.1)。"""
+        path = core.app_info_path(self.game)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write("EXNOA LLC.\nドットアビスX".encode("utf-8"))
+        with open(path, "rb") as handle:
+            before = handle.read()
+        core.safe_repair(self.game)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        self.assertFalse(os.path.isfile(path + ".bak_original"))
+
+    def test_health_check_flags_placeholder_as_failure(self):
+        """占位文件在自检里仍报失败,并说明是占位(不把不完整安装当正常)。"""
+        core.safe_repair(self.game)
+        items = core.health_check(self.game)
+        item = next(i for i in items if i.name == "version")
+        self.assertFalse(item.ok)
+        self.assertIn("占位", item.detail)
 
 
 class VersionNoticeTest(unittest.TestCase):
@@ -616,29 +858,52 @@ class IdentityTest(unittest.TestCase):
         self._write_app_info("EXNOA LLC.\nドットアビスX")
         self.assertEqual(core.read_identity(self.game), ("EXNOA LLC.", "ドットアビスX"))
 
-    def test_ensure_identity_patches_product_and_backs_up(self):
-        self._write_app_info("EXNOA LLC.\nドットアビスX")
-        message = core.ensure_offline_identity(self.game)
-        self.assertIn("_offline", message)
-        self.assertEqual(core.read_identity(self.game), ("EXNOA LLC.", "ドットアビスX_offline"))
-        with open(core.app_info_path(self.game), "rb") as handle:
-            self.assertFalse(handle.read().endswith(b"\n"))  # 无尾换行样式保留
-        self.assertTrue(os.path.isfile(core.app_info_path(self.game) + ".bak_original"))
+    def test_real_product_name_strips_legacy_suffix(self):
+        """老包的 *_offline 是无效改名,推导路径时必须还原真实身份。"""
+        self._write_app_info("EXNOA LLC.\nドットアビスX_offline")
+        self.assertEqual(core.real_product_name(self.game), "ドットアビスX")
 
-    def test_ensure_identity_preserves_trailing_newline(self):
+    def test_real_product_name_keeps_pristine_name(self):
+        self._write_app_info("EXNOA LLC.\nドットアビスX")
+        self.assertEqual(core.real_product_name(self.game), "ドットアビスX")
+
+    def test_real_product_name_falls_back_without_app_info(self):
+        """app.info 缺失也要能推导(用真实身份常量回退)。"""
+        self.assertEqual(core.real_product_name(self.game), core.REAL_PRODUCT_DIR)
+
+    def test_restore_app_info_strips_legacy_suffix(self):
+        """旧版改名残留必须还原,且保留原换行风格(无尾换行)。"""
+        self._write_app_info("EXNOA LLC.\nドットアビスX_offline")
+        message = core.restore_app_info(self.game)
+        self.assertIn("已还原", message)
+        self.assertEqual(core.read_identity(self.game), ("EXNOA LLC.", "ドットアビスX"))
+        with open(core.app_info_path(self.game), "rb") as handle:
+            self.assertFalse(handle.read().endswith(b"\n"))
+
+    def test_restore_app_info_is_noop_when_pristine(self):
         self._write_app_info("EXNOA LLC.\nドットアビスX\n")
-        core.ensure_offline_identity(self.game)
+        message = core.restore_app_info(self.game)
+        self.assertIn("已是原版", message)
         with open(core.app_info_path(self.game), "rb") as handle:
             self.assertTrue(handle.read().endswith(b"\n"))
 
-    def test_ensure_identity_idempotent(self):
-        self._write_app_info("EXNOA LLC.\nドットアビスX_offline")
-        message = core.ensure_offline_identity(self.game)
-        self.assertIn("已就绪", message)
-        self.assertFalse(os.path.isfile(core.app_info_path(self.game) + ".bak_original"))
+    def test_restore_app_info_missing_file(self):
+        self.assertIn("缺失", core.restore_app_info(self.game))
 
-    def test_ensure_identity_missing_file(self):
-        self.assertIn("缺失", core.ensure_offline_identity(self.game))
+    def test_restore_app_info_broken_file_untouched(self):
+        """只有一行时不动文件(格式异常保护)。"""
+        self._write_app_info("EXNOA LLC.")
+        message = core.restore_app_info(self.game)
+        self.assertIn("未改动", message)
+        self.assertEqual(core.read_identity(self.game), ("", ""))
+
+    def test_restore_app_info_cr_only_file_untouched(self):
+        """CR 换行的异常文件:命中「格式异常」保护分支,不改动文件。"""
+        self._write_app_info("EXNOA LLC.\rドットアビスX_offline")
+        message = core.restore_app_info(self.game)
+        self.assertIn("未改动", message)
+        self.assertEqual(core.read_identity(self.game),
+                         ("EXNOA LLC.", "ドットアビスX_offline"))
 
     def test_sanitize_trailing_dot(self):
         self.assertEqual(core._sanitize_path_part("EXNOA LLC."), "EXNOA LLC_")
@@ -649,23 +914,27 @@ class IdentityTest(unittest.TestCase):
     def test_sanitize_plain_name_unchanged(self):
         self.assertEqual(core._sanitize_path_part("ドットアビスX"), "ドットアビスX")
 
-    def test_local_low_dir_uses_env_override_and_offline_product(self):
+    def test_local_low_dir_uses_real_identity_for_legacy_pack(self):
+        """老包(app.info 为 *_offline)也必须指向游戏真正读写的目录。"""
         self._write_app_info("EXNOA LLC.\nドットアビスX_offline")
-        expected = os.path.join(self.base, "EXNOA LLC_", "ドットアビスX_offline")
+        expected = os.path.join(self.base, "EXNOA LLC_", "ドットアビスX")
         self.assertEqual(core.local_low_dir(self.game), expected)
         self.assertEqual(core.local_low_catalog_dir(self.game),
                          os.path.join(expected, "com.unity.addressables"))
 
-    def test_local_low_catalog_dirs_prefers_offline_then_original(self):
+    def test_local_low_catalog_dirs_only_real_dir(self):
+        """候选目录只剩真实身份那一个,不再把旧的 _offline 目录排在前面。"""
         self._write_app_info("EXNOA LLC.\nドットアビスX_offline")
         self.assertEqual(core.local_low_catalog_dirs(self.game), [
-            os.path.join(self.base, "EXNOA LLC_", "ドットアビスX_offline", "com.unity.addressables"),
             os.path.join(self.base, "EXNOA LLC_", "ドットアビスX", "com.unity.addressables"),
         ])
 
-    def test_local_low_dir_empty_without_app_info(self):
-        self.assertEqual(core.local_low_dir(self.game), "")
-        self.assertEqual(core.local_low_catalog_dirs(self.game), [])
+    def test_local_low_dir_falls_back_without_app_info(self):
+        """app.info 缺失时回退真实身份,而不是返回空导致播种静默失效。"""
+        expected = os.path.join(self.base, "EXNOA LLC_", "ドットアビスX")
+        self.assertEqual(core.local_low_dir(self.game), expected)
+        self.assertEqual(core.local_low_catalog_dirs(self.game),
+                         [os.path.join(expected, "com.unity.addressables")])
 
 
 def _zip_bytes(entries) -> bytes:
@@ -784,23 +1053,25 @@ class CatalogSeedTest(unittest.TestCase):
         lines = core.seed_catalog_to_local_low(self.game)
         self.assertIn("缺 catalog 种子", lines[0])
 
-    def test_seed_without_app_info_message(self):
+    def test_seed_without_app_info_uses_real_identity(self):
+        """app.info 缺失也按真实身份播种(不再静默跳过)。"""
         broken = os.path.join(self.tmp.name, "no_identity")
         seed_dir = core.catalog_seed_dir(broken)
         self._write(b"BIN", os.path.join(seed_dir, core.CATALOG_BIN_NAME))
         self._write("h", os.path.join(seed_dir, core.CATALOG_HASH_NAME))
         lines = core.seed_catalog_to_local_low(broken)
-        self.assertIn("无法确定存档目录", lines[0])
+        self.assertIn("已播种", lines[0])
+        target = os.path.join(core.local_low_catalog_dir(broken), core.CATALOG_BIN_NAME)
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), b"BIN")
 
-    def test_source_pair_prefers_offline_then_original(self):
-        offline_dir = core.local_low_catalog_dir(self.game)
-        original_dir = core.local_low_catalog_dirs(self.game)[1]
-        self._write(b"OFFLINE", os.path.join(offline_dir, "1.bin"))
-        self._write("h1", os.path.join(offline_dir, "1.bin.hash"))
-        self._write(b"ORIGINAL", os.path.join(original_dir, "2.bin"))
-        self._write("h2", os.path.join(original_dir, "2.bin.hash"))
+    def test_source_pair_uses_real_identity_dir(self):
+        """取 catalog 的源目录只剩真实身份那一个(不再优先旧的 _offline 目录)。"""
+        real_dir = core.local_low_catalog_dir(self.game)
+        self._write(b"REAL", os.path.join(real_dir, "1.bin"))
+        self._write("h1", os.path.join(real_dir, "1.bin.hash"))
         self.assertEqual(core.source_catalog_pair(self.game)[0],
-                         os.path.join(offline_dir, "1.bin"))
+                         os.path.join(real_dir, "1.bin"))
 
     def test_install_catalog_from_bytes_replaces_with_backup(self):
         self._seed(hash_text="old-hash")
@@ -854,11 +1125,15 @@ class CatalogSeedTest(unittest.TestCase):
     def test_seed_local_low_extras_without_seed_dir_is_noop(self):
         self.assertEqual(core.seed_local_low_extras(self.game), [])
 
-    def test_seed_local_low_extras_without_identity_message(self):
+    def test_seed_local_low_extras_without_app_info_uses_real_dir(self):
+        """app.info 缺失时按真实身份补种,不再静默跳过。"""
         broken = os.path.join(self.tmp.name, "no_id2")
         self._write(b"x", os.path.join(core.local_low_seed_dir(broken), "AbsfRuntimeConfig.dat"))
         lines = core.seed_local_low_extras(broken)
-        self.assertIn("无法确定存档目录", lines[0])
+        self.assertIn("已补种存档目录文件", lines[0])
+        target = os.path.join(core.local_low_dir(broken), "AbsfRuntimeConfig.dat")
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), b"x")
 
 
 class DeltaInstallTest(unittest.TestCase):
@@ -1051,22 +1326,26 @@ class HealthIdentityCatalogTest(unittest.TestCase):
         self.assertFalse(self._item(items, "identity").ok)
         self.assertFalse(self._item(items, "catalog").ok)
 
-    def test_patched_identity_and_seed_pass(self):
+    def test_legacy_renamed_identity_still_passes(self):
+        """老包(app.info 为 *_offline)身份检查也通过 —— 已按真实身份处理。"""
         self._write((core.DATA_DIR_NAME, core.APP_INFO_NAME),
                     "EXNOA LLC.\nドットアビスX_offline".encode("utf-8"))
         seed = core.catalog_seed_dir(self.game)
         self._write_abs(os.path.join(seed, core.CATALOG_BIN_NAME), b"BIN")
         self._write_abs(os.path.join(seed, core.CATALOG_HASH_NAME), b"hash-xyz")
         items = core.health_check(self.game)
-        self.assertTrue(self._item(items, "identity").ok)
+        item = self._item(items, "identity")
+        self.assertTrue(item.ok)
+        self.assertIn("真实身份", item.detail)
         self.assertTrue(self._item(items, "catalog").ok)
 
-    def test_unpatched_identity_detail_mentions_repair(self):
+    def test_pristine_identity_passes(self):
+        """app.info 保持原样(未改名)时身份检查通过。"""
         self._write((core.DATA_DIR_NAME, core.APP_INFO_NAME),
                     "EXNOA LLC.\nドットアビスX".encode("utf-8"))
         item = self._item(core.health_check(self.game), "identity")
-        self.assertFalse(item.ok)
-        self.assertIn("修复", item.detail)
+        self.assertTrue(item.ok)
+        self.assertIn("ドットアビスX", item.detail)
 
 
 class CollectDiagnosticsTest(unittest.TestCase):

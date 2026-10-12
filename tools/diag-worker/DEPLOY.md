@@ -17,7 +17,7 @@
 - 本机已装 Node(本项目机已确认有 `node`/`npx`)。`wrangler` 无需全局装,统一用 `npx wrangler`。
 - 下面命令都在**本目录** `tools/diag-worker/` 下执行:
   ```powershell
-  cd e:\agent\dmm\dotabyss\tools\diag-worker
+  cd <repo>\tools\diag-worker
   ```
 
 ## 1. 登录 Cloudflare(浏览器 OAuth,一次即可)
@@ -92,7 +92,7 @@ $env:DOTABYSS_DIAG_UPLOAD_TOKEN = "第4步的令牌"
 ## 7. 端到端自检(部署后立刻验一次)
 用现成脚本打一个包并上传(拿你机器上的真实日志):
 ```powershell
-cd e:\agent\dmm\dotabyss\tools\launcher
+cd <repo>\tools\launcher
 $env:DOTABYSS_DIAG_UPLOAD_URL   = "https://dotabyss-diag-collector.<你的子域>.workers.dev/"
 $env:DOTABYSS_DIAG_UPLOAD_TOKEN = "第4步的令牌"
 D:\Python\python.exe build_log_diag_zip.py ..\..\client\BepInEx\LogOutput.log ..\..\client\BepInEx\offline-api.log --upload

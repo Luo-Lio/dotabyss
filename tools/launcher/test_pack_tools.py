@@ -15,6 +15,7 @@ import zipfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dotabyss_offline_core as core  # noqa: E402
 import dotabyss_pack_tools as pack_tools  # noqa: E402
+import build_full_pack as full_pack  # noqa: E402
 
 
 def _md5(data: bytes) -> str:
@@ -158,6 +159,43 @@ class WriteManifestZipTest(PackFixture):
         self.assertEqual(manifest["files"], {})
         with zipfile.ZipFile(zip_path) as archive:
             self.assertEqual(archive.namelist(), [])
+
+
+class AppInfoPristineTest(PackFixture):
+    """打包收尾:app.info 保持原版身份(不再做无效的 _offline 改名)。"""
+
+    def _app_info(self, text):
+        """写 ``_Data/app.info``(返回路径)。"""
+        return self._put("%s/%s" % (core.DATA_DIR_NAME, core.APP_INFO_NAME),
+                         text.encode("utf-8"))
+
+    def test_restores_legacy_rename(self):
+        """旧残留 ``*_offline`` 会被还原,并清掉开发机备份。"""
+        path = self._app_info("EXNOA LLC.\nドットアビスX_offline")
+        with open(path + ".bak_original", "wb") as handle:
+            handle.write(b"old")
+        message = full_pack.ensure_pristine_app_info(self.pack)
+        self.assertIn("已还原", message)
+        self.assertEqual(core.read_identity(self.pack), ("EXNOA LLC.", "ドットアビスX"))
+        self.assertFalse(os.path.isfile(path + ".bak_original"))
+
+    def test_pristine_is_noop(self):
+        """原版身份:不改内容,只清掉可能存在的备份。"""
+        path = self._app_info("EXNOA LLC.\nドットアビスX\n")
+        with open(path, "rb") as handle:
+            before = handle.read()
+        with open(path + ".bak_original", "wb") as handle:
+            handle.write(b"old")
+        message = full_pack.ensure_pristine_app_info(self.pack)
+        self.assertIn("已是原版", message)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        self.assertFalse(os.path.isfile(path + ".bak_original"))
+
+    def test_missing_app_info_aborts(self):
+        """app.info 缺失时中止打包(不产出半成品)。"""
+        with self.assertRaises(SystemExit):
+            full_pack.ensure_pristine_app_info(self.pack)
 
 
 if __name__ == "__main__":

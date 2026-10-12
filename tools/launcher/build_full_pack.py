@@ -14,9 +14,9 @@
   <仓库>\\dist\\ドットアビスX离线版\\             完整包目录(交付根)
   <仓库>\\dist\\ドットアビスX离线版_<版本>.zip   --zip 时的压缩包
 
-生成阶段会做两件"包级"修改:
-  1) 身份隔离:把 ``_Data\\app.info`` 产品名改成 ``_offline`` 后缀
-     (LocalLow 存档/缓存、注册表与在线版完全分开);
+生成阶段会做两件"包级"处理:
+  1) app.info 保持**原版身份**:不再做 ``_offline`` 改名 —— 实测该改名对 Unity 的
+     persistentDataPath 与 PlayerPrefs 注册表根都无效(见 docs §2.1);若发现旧残留会还原;
   2) catalog 种子:把本机 LocalLow 里最近一份 catalog 写入
      ``BepInEx/plugins/StoryViewer/catalog_seed``,新机器首启时由启动器播种到
      LocalLow(插件也优先读种子)。
@@ -157,14 +157,16 @@ def write_player_config(out_dir: str, src: str) -> str:
     return plugin_version
 
 
-def write_identity(out_dir: str) -> str:
-    """把包内 app.info 设为离线身份(产品名 ``_offline`` 后缀)。
+def ensure_pristine_app_info(out_dir: str) -> str:
+    """确保包内 app.info 是**原版身份**(不再做无效的 ``_offline`` 改名)。
 
-    说明:``app.info.bak_original`` 属于开发机备份,不进包(打包后清掉)。
+    旧版打包会改名;这里反过来做:发现 ``*_offline`` 残留就还原成真实产品名
+    (核心逻辑在 ``core.restore_app_info``,已单测),并清掉开发机留下的
+    ``app.info.bak_original``。返回中文说明。
     """
-    message = core.ensure_offline_identity(out_dir)
-    if "_offline" not in message:
-        _fail("身份隔离失败:%s" % message)
+    message = core.restore_app_info(out_dir)
+    if "失败" in message or "未改动" in message:
+        _fail("app.info 无法保持原版身份:%s" % message)
     backup = core.app_info_path(out_dir) + ".bak_original"
     if os.path.isfile(backup):
         os.remove(backup)
@@ -342,8 +344,7 @@ def verify(out_dir: str, version: str, src: str) -> bool:
     check("first_ready 待首启", data.get("first_ready") is False)
 
     _company, product = core.read_identity(out_dir)
-    check("离线身份(_offline)", bool(product) and product.endswith(core.IDENTITY_SUFFIX),
-          product or "(app.info 缺失)")
+    check("app.info 原版身份", product == core.REAL_PRODUCT_DIR, product or "(app.info 缺失)")
     seed_bin, seed_hash = core.seed_catalog_pair(out_dir)
     check("catalog 种子", bool(seed_bin) and bool(seed_hash),
           core.catalog_hash_text(seed_hash)[:12])
@@ -431,7 +432,7 @@ def main() -> int:
         copy_layer(src, out_dir)
 
     plugin_version = write_player_config(out_dir, src)
-    print("[identity] %s" % write_identity(out_dir))
+    print("[identity] %s" % ensure_pristine_app_info(out_dir))
     print("[catalog] %s" % write_catalog_seed(out_dir, src, args.catalog_bin))
     extras = write_local_low_seed(out_dir, src)
     print("[seed] %s" % ("、".join(extras) if extras else "(无附属种子,可忽略)"))

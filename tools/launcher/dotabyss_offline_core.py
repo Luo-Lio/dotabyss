@@ -7,6 +7,8 @@
 """
 
 from dataclasses import dataclass
+import base64
+import binascii
 import hashlib
 import io
 import json
@@ -32,8 +34,14 @@ CONFIG_REL = ("BepInEx", "config", "dotabyss.storyviewer.cfg")
 DATA_DIR_NAME = "ドットアビスX_Data"
 CACHE_DIR_NAME = "Caches"
 
-# 离线身份隔离:app.info 产品名加此后缀,LocalLow 存档/缓存/注册表与在线版完全分开。
+# 旧版离线包曾把 app.info 产品名加此后缀(自称「身份隔离」)。**实测无效**:Unity 的
+# company/product 取自构建期 PlayerSettings,改 app.info 既不影响 persistentDataPath,
+# 也不影响 PlayerPrefs 的注册表根(见 docs\离线版实现说明_开发者必读.md §2.1)。
+# 该后缀只保留给**归一化**用:老包的 app.info 仍是 *_offline,推导路径时要还原真实身份。
 IDENTITY_SUFFIX = "_offline"
+# 游戏真实身份目录名(Unity 实际使用;app.info 缺失时也用它回退)。
+REAL_COMPANY_DIR = "EXNOA LLC_"
+REAL_PRODUCT_DIR = "ドットアビスX"
 APP_INFO_NAME = "app.info"
 
 # 包内 catalog 种子(插件目录 catalog_seed\,插件优先读它,首备时同步到 LocalLow)。
@@ -46,6 +54,17 @@ LOCAL_LOW_SEED_DIR_NAME = "local_low_seed"
 
 # LocalLow 根目录覆盖(自测/重定向用;留空则用系统默认)。
 LOCAL_LOW_ENV = "DOTABYSS_LOCAL_LOW_BASE"
+
+# 存档(prefs)健康:游戏把设置写进 HKCU\Software\<公司>\<产品>,值是 base64(AES-CBC 密文,
+# 长度必为 16 的倍数)。实测:值为明文时游戏解密得 null → 启动即崩(见
+# docs\离线版实现说明_开发者必读.md §2.3),所以启动前要把解不开的值隔离掉。
+# 只操作游戏自己的键;Unity 自己的键一律不碰。
+PREFS_COMPANY_KEY = r"Software\EXNOA LLC."
+PREFS_GAME_KEY = r"Software\EXNOA LLC.\ドットアビスX"
+PREFS_STORE_ENV = "DOTABYSS_PREFS_STORE_FILE"   # 自测:指向 JSON 假存储 {键名: 十六进制}
+PREFS_UNITY_PREFIX = "unity"                    # Unity 自己的键名前缀,一律跳过
+PREFS_AES_BLOCK = 16                            # AES 块长(密文长度必须是它的倍数)
+PREFS_BACKUP_PREFIX = "prefs_backup_"           # 隔离前的备份文件名前缀
 
 # 插件内置假 API 服务器端口(与 dotabyss.storyviewer.cfg 的 [Offline] ApiPort 一致)。
 API_PORT = 18923
@@ -232,40 +251,52 @@ def read_identity(game_dir: str) -> tuple:
     return lines[0].strip(), lines[1].strip()
 
 
-def ensure_offline_identity(game_dir: str) -> str:
-    """把 ``app.info`` 产品名改为 ``_offline`` 后缀(身份隔离),返回中文说明。
+def real_product_name(game_dir: str) -> str:
+    """返回游戏**真实**身份的产品名(Unity 实际使用的那个)。
 
-    首次改动前留 ``app.info.bak_original`` 备份(不进包);已隔离时为空操作。
+    读 ``app.info`` 产品名并去掉旧版的 ``_offline`` 后缀 —— 那是无效改名(见
+    ``docs\\离线版实现说明_开发者必读.md`` §2.1),推导目录时必须还原,否则会往游戏
+    根本不读的目录里播种。``app.info`` 缺失时回退 ``REAL_PRODUCT_DIR``。
+    """
+    _company, product = read_identity(game_dir)
+    product = (product or "").strip()
+    if product.endswith(IDENTITY_SUFFIX):
+        product = product[:-len(IDENTITY_SUFFIX)]
+    return product or REAL_PRODUCT_DIR
+
+
+def restore_app_info(game_dir: str) -> str:
+    """把 ``app.info`` 产品名还原成真实身份(去掉旧版的 ``_offline``),返回中文说明。
+
+    只改第二行、保留原换行风格;已还原时为空操作;``app.info`` 缺失或格式异常时不改动。
+    用于打包时清掉旧版「身份隔离」改名残留(实测该改名无效,见 docs §2.1)。
     """
     path = app_info_path(game_dir)
-    company, product = read_identity(game_dir)
-    if not company or not product:
-        return "app.info 缺失或损坏,无法设置离线身份(请重新解压完整包)"
-    if product.endswith(IDENTITY_SUFFIX):
-        return "离线身份已就绪(%s)" % product
+    _company, product = read_identity(game_dir)
+    if not product:
+        return "app.info 缺失或损坏,未改动"
+    if not product.endswith(IDENTITY_SUFFIX):
+        return "app.info 已是原版身份(%s)" % product
+    restored = product[:-len(IDENTITY_SUFFIX)]
     try:
         with open(path, "rb") as handle:
             raw = handle.read()
-        new_product = product + IDENTITY_SUFFIX
         lines = raw.decode("utf-8", errors="replace").split("\n")
         if len(lines) < 2:
             return "app.info 格式异常,未改动"
-        backup = path + ".bak_original"
-        if not os.path.isfile(backup):
-            shutil.copy2(path, backup)
-        lines[1] = new_product
+        lines[1] = restored
         with open(path, "wb") as handle:
             handle.write("\n".join(lines).encode("utf-8"))
     except OSError as error:
-        return "设置离线身份失败:%s" % error
-    return "已设置离线身份:%s → %s" % (product, new_product)
+        return "还原 app.info 失败:%s" % error
+    return "已还原 app.info 身份:%s → %s" % (product, restored)
 
 
 def _sanitize_path_part(name: str) -> str:
     """按 Unity 规则清洗路径片段:非法字符与结尾句点替换为下划线。
 
     实测 Unity 把公司名 ``EXNOA LLC.`` 映射为目录 ``EXNOA LLC_``(结尾句点
-    在 Windows 路径里非法),此处只做必要规则,保证 ``_offline`` 目录推导正确。
+    在 Windows 路径里非法),此处只做必要规则,保证身份目录推导正确。
     """
     cleaned = "".join(
         "_" if (ch in '<>:"/\\|?*' or ord(ch) < 32) else ch for ch in name)
@@ -284,36 +315,217 @@ def local_low_base() -> str:
 
 
 def local_low_dir(game_dir: str, base: str = "") -> str:
-    """返回离线身份对应的 LocalLow 应用目录(仅推导路径,不创建)。"""
-    company, product = read_identity(game_dir)
-    if not company or not product:
-        return ""
+    """返回游戏真实身份对应的 LocalLow 应用目录(仅推导路径,不创建)。
+
+    这是游戏与插件**实际读写**的目录(与 ``Application.persistentDataPath`` 同源),
+    由构建期身份决定,与 ``app.info`` 是否被改过无关。
+    """
     root = base or local_low_base()
-    return os.path.join(root, _sanitize_path_part(company), _sanitize_path_part(product))
+    return os.path.join(root, _sanitize_path_part(REAL_COMPANY_DIR),
+                        _sanitize_path_part(real_product_name(game_dir)))
 
 
 def local_low_catalog_dir(game_dir: str, base: str = "") -> str:
-    """返回离线身份下 Addressables catalog 目录(``LocalLow\\...\\com.unity.addressables``)。"""
+    """返回真实身份下 Addressables catalog 目录(``LocalLow\\...\\com.unity.addressables``)。"""
     root = local_low_dir(game_dir, base)
     return os.path.join(root, "com.unity.addressables") if root else ""
 
 
 def local_low_catalog_dirs(game_dir: str, base: str = "") -> list:
-    """返回 catalog 搜索候选目录:离线身份目录在前,原版身份目录在后。"""
-    company, product = read_identity(game_dir)
-    if not company or not product:
-        return []
-    root = base or local_low_base()
-    products = [product]
-    if product.endswith(IDENTITY_SUFFIX):
-        products.append(product[:-len(IDENTITY_SUFFIX)])
-    directories = []
-    for name in products:
-        path = os.path.join(root, _sanitize_path_part(company),
-                            _sanitize_path_part(name), "com.unity.addressables")
-        if path not in directories:
-            directories.append(path)
-    return directories
+    """返回 catalog 搜索候选目录(只有游戏真实身份那一个)。
+
+    旧版会把 ``*_offline`` 目录排在最前,那是无效身份;现在统一只认真实目录,
+    避免误读旧目录里的陈旧 catalog。
+    """
+    return [local_low_catalog_dir(game_dir, base)]
+
+
+# ---------------------------------------------------------------- 存档(prefs)健康
+
+LAST_PREFS_ERROR = ""
+
+
+def _prefs_store_from_env():
+    """按 ``PREFS_STORE_ENV`` 读 JSON 假存储;未设置返回 ``None``。
+
+    假存储格式为 ``{键名: 十六进制字符串}``,仅用于自测,不碰真实注册表。
+    文件不存在或内容损坏时抛 ``OSError`` / ``json.JSONDecodeError``,由调用方转成可读说明。
+    """
+    path = (os.environ.get(PREFS_STORE_ENV) or "").strip()
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    store = {}
+    for name, value in (raw or {}).items():
+        try:
+            store[str(name)] = bytes.fromhex(str(value))
+        except ValueError:
+            continue
+    return store
+
+
+def load_prefs_store():
+    """读取游戏存档键下的全部值,返回 ``{键名: 原始值}``。
+
+    返回值:``None`` 表示**读不到**(非 Windows / 权限不足 / 假存储损坏),原因见
+    ``LAST_PREFS_ERROR``;``{}`` 表示键不存在或确实为空(不算故障)。
+    ``REG_BINARY`` 的值是 ``bytes``,其它类型保持 ``str`` / ``int``(分类时一律跳过)。
+    本函数**只读**,绝不改动任何值。
+    """
+    global LAST_PREFS_ERROR
+    LAST_PREFS_ERROR = ""
+    try:
+        fake = _prefs_store_from_env()
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        LAST_PREFS_ERROR = "假存储不可读:%s" % error
+        return None
+    if fake is not None:
+        return fake
+    try:
+        import winreg
+    except ImportError:
+        LAST_PREFS_ERROR = "当前 Python 无 winreg(非 Windows 环境)"
+        return None
+    store = {}
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, PREFS_GAME_KEY)
+    except FileNotFoundError:
+        return store
+    except OSError as error:
+        LAST_PREFS_ERROR = "打开存档键失败:%s" % error
+        return None
+    try:
+        index = 0
+        while True:
+            try:
+                name, data, _kind = winreg.EnumValue(key, index)
+            except OSError:
+                break
+            store[str(name)] = data
+            index += 1
+    finally:
+        try:
+            winreg.CloseKey(key)
+        except OSError:
+            pass
+    return store
+
+
+def classify_prefs_value(name: str, data) -> str:
+    """把一个存档值分为 ``"cipher"`` / ``"plain"`` / ``"skip"``。
+
+    游戏的设置值是 base64 文本(AES-CBC 密文,解码后长度必为 16 的倍数);解不开、
+    为空、或长度不是 16 的倍数,说明是明文或损坏 —— 游戏读它会解密得 null 而崩溃,
+    属**待隔离**项。``"skip"`` 表示不属于游戏设置(Unity 自己的键、非字节值),一律不碰。
+    """
+    if not isinstance(data, bytes):
+        return "skip"
+    if str(name).startswith(PREFS_UNITY_PREFIX):
+        return "skip"
+    text = data.rstrip(b"\x00")
+    if not text:
+        return "plain"
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return "plain"
+    if len(raw) == 0 or len(raw) % PREFS_AES_BLOCK != 0:
+        return "plain"
+    return "cipher"
+
+
+def prefs_store_health(store=None) -> tuple:
+    """汇总存档健康,返回 ``(ok, 中文说明, 待隔离键名列表)``。
+
+    参数:``store`` 仅用于自测(注入 ``{键名: 原始值}``);为 ``None`` 时读真实注册表。
+    键不存在(游戏从未写过设置)视为健康;读不到注册表则 ``ok=False`` 并如实说明原因。
+    """
+    if store is None:
+        store = load_prefs_store()
+    if store is None:
+        return False, LAST_PREFS_ERROR or "存档不可读", []
+    if not store:
+        return True, "存档键尚未创建(游戏首次运行会自行建立)", []
+    plain = sorted(name for name, data in store.items()
+                   if classify_prefs_value(name, data) == "plain")
+    if plain:
+        return False, ("存档有 %d/%d 个值无法解密(明文或损坏)"
+                       % (len(plain), len(store))), plain
+    return True, "存档 %d 个值全部可解密" % len(store), []
+
+
+def _delete_prefs_values(names: list, store=None) -> tuple:
+    """删除指定存档值,返回 ``(已删列表, 错误说明)``。
+
+    ``store`` 非 ``None`` 时视为自测注入的存储,直接在字典里删除;否则删真实注册表。
+    任一步失败即停止删除,并把原因作为第二项返回(调用方须如实报告)。
+    """
+    if store is not None:
+        for name in names:
+            store.pop(name, None)
+        return list(names), ""
+    try:
+        import winreg
+    except ImportError:
+        return [], "当前 Python 无 winreg(非 Windows 环境)"
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, PREFS_GAME_KEY, 0,
+                             winreg.KEY_SET_VALUE)
+    except OSError as error:
+        return [], "打开存档键(可写)失败:%s" % error
+    deleted = []
+    try:
+        for name in names:
+            try:
+                winreg.DeleteValue(key, name)
+            except OSError as error:
+                return deleted, "删除 %s 失败:%s" % (name, error)
+            deleted.append(name)
+    finally:
+        try:
+            winreg.CloseKey(key)
+        except OSError:
+            pass
+    return deleted, ""
+
+
+def repair_prefs_store(game_dir: str, store=None) -> list:
+    """把游戏解不开的存档值隔离掉(先备份、再删除),返回中文日志行。
+
+    参数:``store`` 仅用于自测(注入 ``{键名: 原始值}``);为 ``None`` 时读写真实注册表。
+    返回:逐条中文说明。**备份写失败时不删除任何值**并如实报告。
+    幂等:没有待隔离项时不做任何改动。备份落在 ``BepInEx\\prefs_backup_<时间戳>.json``。
+    """
+    current = store if store is not None else load_prefs_store()
+    if current is None:
+        return ["存档修复跳过:%s" % (LAST_PREFS_ERROR or "存档不可读")]
+    ok, detail, plain = prefs_store_health(current)
+    if not plain:
+        return ["存档设置全部可解密,无需修复"] if ok else ["存档检查跳过:%s" % detail]
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(logs_dir(game_dir), PREFS_BACKUP_PREFIX + stamp + ".json")
+    backup = {"store": "HKCU\\" + PREFS_GAME_KEY, "deleted": {}}
+    for name in plain:
+        data = current.get(name)
+        backup["deleted"][name] = (data if isinstance(data, bytes) else b"").hex()
+    try:
+        os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+        with open(backup_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(backup, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    except OSError as error:
+        return ["存档修复中止:备份写入失败(%s),未删除任何值" % error]
+
+    deleted, error = _delete_prefs_values(plain, current)
+    lines = ["已备份 %d 个待隔离值到 %s" % (len(plain), os.path.basename(backup_path))]
+    if error:
+        lines.append("存档修复部分失败:%s(已隔离 %d 个)" % (error, len(deleted)))
+        return lines
+    lines.append("已隔离 %d 个无法解密的存档值(游戏将回退默认值):%s"
+                 % (len(deleted), ", ".join(deleted)))
+    return lines
 
 
 # ---------------------------------------------------------------- catalog 种子
@@ -508,14 +720,14 @@ def load_version(game_dir: str) -> dict:
     path = version_path(game_dir)
     if not os.path.isfile(path):
         return {"version": "", "baseline": "", "channel": "", "plugin_version": "",
-                "notice": "", "first_ready": False}
+                "notice": "", "first_ready": False, "placeholder": False}
     try:
         with open(path, "r", encoding="utf-8") as version_file:
             data = json.load(version_file)
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {"version": "", "baseline": "", "channel": "", "plugin_version": "",
-                "notice": "", "first_ready": False}
+                "notice": "", "first_ready": False, "placeholder": False}
 
 
 def version_notice(data) -> str:
@@ -975,13 +1187,16 @@ def health_check(game_dir: str) -> list:
                                % (cache_count, CACHE_MIN_ENTRIES))
 
     _company, product = read_identity(game_dir)
+    real_product = real_product_name(game_dir)
     if not product:
-        identity_item = CheckItem("identity", False, "app.info 缺失,无法确认离线身份")
-    elif product.endswith(IDENTITY_SUFFIX):
-        identity_item = CheckItem("identity", True, "离线身份 %s" % product)
-    else:
         identity_item = CheckItem("identity", False,
-                                  "身份未隔离(%s;点「修复」自动处理)" % product)
+                                  "app.info 缺失(按真实身份 %s 推导)" % real_product)
+    elif product != real_product:
+        identity_item = CheckItem("identity", True,
+                                  "app.info 为旧版改名(%s),已按真实身份 %s 处理"
+                                  % (product, real_product))
+    else:
+        identity_item = CheckItem("identity", True, "身份 %s" % real_product)
 
     seed_bin, seed_hash = seed_catalog_pair(game_dir)
     if seed_bin and seed_hash:
@@ -989,6 +1204,17 @@ def health_check(game_dir: str) -> list:
             "catalog", True, "catalog 种子就绪(%s)" % (catalog_hash_text(seed_hash)[:12] or "无哈希"))
     else:
         catalog_item = CheckItem("catalog", False, "包内缺 catalog 种子(请重新解压完整包)")
+
+    # 版本文件三态:缺失 / 占位(曾缺失,由 safe_repair 生成)/ 正常。
+    # 占位仍判失败 —— 安装确实不完整,自检要如实提示;只是不再每次启动重跑首次准备。
+    if not os.path.isfile(version):
+        version_item = CheckItem("version", False,
+                                 "offline_version.json 缺失(建议重新解压完整包)")
+    elif load_version(game_dir).get("placeholder"):
+        version_item = CheckItem("version", False,
+                                 "版本文件为占位(曾缺失,建议重新解压完整包)")
+    else:
+        version_item = CheckItem("version", True, "版本文件存在")
 
     return [
         CheckItem("exe", os.path.isfile(exe),
@@ -1008,8 +1234,7 @@ def health_check(game_dir: str) -> list:
         cache_item,
         _zone_check([exe, winhttp, dll]),
         _port_check(),
-        CheckItem("version", os.path.isfile(version),
-                  "版本文件存在" if os.path.isfile(version) else "offline_version.json 缺失"),
+        version_item,
     ]
 
 
@@ -1050,7 +1275,7 @@ def safe_repair(game_dir: str) -> list:
 
     logs.append(repair_config(game_dir))
 
-    logs.append(ensure_offline_identity(game_dir))
+    # 不再改 app.info:该「身份隔离」实测无效(见 docs §2.1),只会让包偏离原版。
     logs.extend(seed_catalog_to_local_low(game_dir))
     logs.extend(seed_local_low_extras(game_dir))
 
@@ -1060,12 +1285,23 @@ def safe_repair(game_dir: str) -> list:
         if line:
             logs.append(line)
 
-    if os.path.isfile(version_path(game_dir)):
-        data = load_version(game_dir)
-        if not data.get("first_ready"):
-            data["first_ready"] = True
-            save_version(game_dir, data)
-            logs.append("已将 first_ready 设为 true")
+    # 版本文件缺失时也必须落 first_ready:否则 load_version 每次回落默认值,
+    # 启动器每次启动都重跑首次准备(全目录 Unblock-File + 配置修复 + 播种,很慢)
+    # 并反复报「offline_version.json 缺失」(issue #1 的现象)。
+    # 缺失时写一份带 placeholder 标记的占位文件:自检据此仍如实报告缺失,
+    # 不会把不完整安装当成正常包。
+    version_exists = os.path.isfile(version_path(game_dir))
+    data = load_version(game_dir)
+    if not data.get("first_ready"):
+        if not version_exists:
+            data["placeholder"] = True
+        data["first_ready"] = True
+        save_version(game_dir, data)
+        logs.append("已将 first_ready 设为 true(版本文件缺失,已写占位)"
+                    if not version_exists else "已将 first_ready 设为 true")
+
+    # 存档健康:把游戏解不开的值隔离掉(否则读设置即崩,见 docs §2.3)。
+    logs.extend(repair_prefs_store(game_dir))
     return logs
 
 
@@ -1599,7 +1835,7 @@ def _diag_machine_state_lines() -> list:
     probes = (
         (r"在线身份目录(%USERPROFILE%\AppData\LocalLow\EXNOA LLC_\ドットアビスX)",
          os.path.join(locallow, "ドットアビスX")),
-        (r"离线身份目录(%USERPROFILE%\AppData\LocalLow\EXNOA LLC_\ドットアビスX_offline)",
+        (r"旧版离线身份目录(无效改名遗留,%USERPROFILE%\AppData\LocalLow\EXNOA LLC_\ドットアビスX_offline)",
          os.path.join(locallow, "ドットアビスX_offline")),
         (r"DMM Game Player(%APPDATA%\dmmgameplayer5)",
          os.path.join(appdata, "dmmgameplayer5")),
@@ -1617,7 +1853,7 @@ def _diag_machine_state_lines() -> list:
         lines.append(r"HKCU\Software\EXNOA LLC.:探测失败")
 
     runtime_path = os.path.join(
-        locallow, "ドットアビスX_offline", "AbsfRuntimeConfig.dat")
+        locallow, REAL_PRODUCT_DIR, "AbsfRuntimeConfig.dat")
     try:
         if os.path.isfile(runtime_path):
             try:

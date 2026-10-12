@@ -126,21 +126,20 @@ if exist "%LJ%" (
   echo   WARN: launcher.json missing - the Update button stays disabled
 )
 
-echo [12/14] offline identity
+echo [12/14] app.info identity
 if defined DATADIR (
   if exist "!DATADIR!\app.info" (
     "%FINDSTR%" /c:"_offline" "!DATADIR!\app.info" >nul
     if errorlevel 1 (
-      echo   FAIL: app.info product name has no _offline suffix - run launcher Repair
-      set FAIL=1
+      echo   OK: app.info keeps the original product name
     ) else (
-      echo   OK: identity isolated ^(product name *_offline^)
+      echo   INFO: app.info still has the legacy _offline suffix ^(pre-2026-10-11 pack; harmless, launcher ignores it^)
     )
   ) else (
     echo   FAIL: app.info missing in !DATADIR! - incomplete pack & set FAIL=1
   )
 ) else (
-  echo   FAIL: no *_Data folder - cannot check identity & set FAIL=1
+  echo   FAIL: no *_Data folder - cannot check app.info & set FAIL=1
 )
 
 echo [13/14] catalog seed
@@ -166,7 +165,10 @@ set "SAVE="
 for /d %%D in ("%USERPROFILE%\AppData\LocalLow\EXNOA*") do set "SAVE=%%~fD"
 if defined SAVE (
   echo   INFO: save root: !SAVE!
-  if exist "!SAVE!\*_offline" (echo   OK: offline identity folder exists) else (echo   INFO: offline identity folder not created yet - first launch will create it)
+  if exist "!SAVE!\*_offline" (echo   INFO: legacy _offline folder present ^(not used by the game, safe to delete^))
+  set "GSAVE="
+  for /d %%D in ("!SAVE!\*") do set "GSAVE=1"
+  if defined GSAVE (echo   OK: save folder present) else (echo   INFO: save folder not created yet - first launch will create it)
 ) else (
   echo   INFO: no EXNOA save root yet - created on first launch
 )
