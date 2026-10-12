@@ -162,31 +162,28 @@ DotabyssOfflineLauncher.exe --game-dir <旧包目录> --release-dir <发布目�
 - 完整包 zip 约 8 GB,**超过 GitHub Release 单附件上限**,走网盘/其他渠道分发;
   更新通道附件正常发 GitHub Release。
 
-## 8. 当前发布(20261011)
+## 8. 当前发布(20261012)
 
-> 记录于 2026-10-11。修复版:**内容与 20261010 相同,只修插件与启动器**;基线仍 `20260924`。
+> 记录于 2026-10-12。修复版:**内容与 20261011 相同,只更新启动器与玩家文档**;基线仍 `20260924`。
 > 下次发布按 §4 执行,完成后把本节改写为新的「当前发布」块。
 
-- **插件 0.7.30**:`BitConverter` 空字节兜底**回退为 3 个**已知崩溃族
-  (`ToBoolean / ToInt16 / ToInt32`)。0.7.29 扩到 10 个重载后,对 `ToUInt32` 等目标装 Harmony
-  detour 会与 `il2cpp_runtime_invoke` 无限互递归 → 栈溢出(0xc00000fd),**玩家打开剧情面板/
-  播放剧情时游戏崩溃**;0.7.30 因此回退,启动自检行随之恢复为
-  `[空字节兜底] BitConverter 保护已安装: N/3 目标`(详情见 `离线版实现说明_开发者必读.md` §2.4)。
+- **插件 0.7.30**(未变):`BitConverter` 空字节兜底保持 **3 个**已知崩溃族
+  (`ToBoolean / ToInt16 / ToInt32`);**不要**再扩回 0.7.29 的 10 个重载(对 `ToUInt32` 等目标装
+  Harmony detour 会与 `il2cpp_runtime_invoke` 互递归 → 栈溢出)。细节见 `离线版实现说明_开发者必读.md` §2.4。
 - **启动器(重新冻结)**:`client\DotabyssOfflineLauncher.exe`,md5
-  `98C9B604AD463C2B2DA43404C87179C7`,冒烟 `PASS`;诊断上传端点常量经 PyInstaller 归档 API
-  复核仍在 exe 的 PYZ 内且非空。三项变化:
-  1. **版本检查改走 GitHub CDN,不再访问 REST API**:取
-     `https://github.com/<repo>/releases/latest/download/version.json`,附件 URL 由固定名拼成
-     `.../releases/latest/download/<附件名>`;新增纯函数
-     `dotabyss_offline_core.release_from_cdn_base(base_url)`。原因:匿名 `api.github.com` 每 IP
-     60 次/小时,共享出口会被 `HTTP 403 rate limit exceeded` 挡住。副作用边界:`releases/latest`
-     不含 prerelease/draft(本项目发布都是正式版)。**演练因此不再需要 `release.json`**(见 §5)。
-  2. **新增下载进度显示**:大附件下载显示百分比/进度条(有 `Content-Length` 时确定态,否则不确定态)。
-  3. **修自替换重启**:新脚本最长轮询约 60s 等文件解锁,**只有替换成功才 `start`**,失败会追加写入
-     游戏根 `launcher-error.log`;并在关闭前/启动期给出可见的「正在重启」提示。旧脚本重试窗口过短
-     且替换失败仍无条件 `start`,导致「离线更新后窗口关闭、不自动重开」。
-- **发布物**:Release **20261011** 与离线更新包 `dist\ドットアビスX_更新包_20261011.zip`
-  (同一次发布的同一套资产);老玩家直接点「更新」即可(插件与启动器都会更新)。
+  `64A38A80066AA7ECB3F7D583CD167D85`,冒烟 `PASS`;内建诊断端点经 PyInstaller 归档 API 复核仍在
+  (非空)。本版变化:
+  1. **离线共享存档健康修复**:启动/修复前对共享 `PrefsStore` 做健康检查,把游戏**无法解密的明文值**
+     先备份(`BepInEx\prefs_backup_<stamp>.json`)再隔离,防黑屏复发;高级区新增「存档修复」
+     (备份失败即中止、不删任何值)。
+  2. **身份清理**:不再把 `app.info` 改成 `_offline`(实测对 `persistentDataPath` 与 PlayerPrefs
+     注册表根无效);旧 `_offline` 残留会还原为原版,目录一律按真实身份推导。`build_full_pack`
+     同步不再改 `app.info`;`check_health` 的 `[12/14]` 身份项改为「保持原版身份」判定。
+  3. **修复**:版本文件缺失时不再每次启动重跑首次准备(写占位并置 `first_ready`)——即 issue #1 里
+     「反复弹缺 `offline_version.json`」的现象。
+- **玩家文档**:《安装排障》新增「从 Release 散件自建 `launcher.json`」与「开系统代理后 502
+  (TUN + 排除 `127.0.0.1/8`)」两节。
+- **发布物**:Release **20261012**(10 个附件;无素材增量故无 `caches_update.zip`)与离线更新包
+  `dist\ドットアビスX_更新包_20261012.zip`(同一次发布的同一套资产);老玩家点「更新」即可(只换启动器与文档)。
 
-> 上一版 §8 的「窗口期注意」已随发布失效:本机 `client\` 启动器与 `dist\release_20261011\`
-> 的 `launcher_md5` 一致(均为上面的 md5),dev 包可以放心点「更新」。
+> dev 包与本机 `client\` 启动器一致(上面 md5),可以放心点「更新」。
